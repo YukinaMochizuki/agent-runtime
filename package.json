@@ -1,0 +1,33 @@
+{
+  "name": "agent-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts",
+    "./claude": "./src/claude/index.ts",
+    "./openai-compat": "./src/openai-compat/index.ts"
+  },
+  "files": [
+    "src"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "bun test"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/claude-agent-sdk": ">=0.3.280",
+    "zod": "^4.4.3"
+  },
+  "devDependencies": {
+    "@ai-sdk/provider": "^4.0.37",
+    "@anthropic-ai/claude-agent-sdk": "0.3.280",
+    "@types/bun": "latest",
+    "typescript": "^5",
+    "zod": "4.4.3"
+  },
+  "dependencies": {
+    "@ai-sdk/openai-compatible": "^3.0.87",
+    "ai": "^7.0.166"
+  }
+}
