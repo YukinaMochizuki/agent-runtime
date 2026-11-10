@@ -5,6 +5,7 @@ import { MockLanguageModelV4, convertArrayToReadableStream } from "ai/test";
 import { z } from "zod";
 import type { ToolBoundary } from "../src/boundary.ts";
 import { OpenAICompatBackend, toToolOutput, unansweredCalls, wireToolName, type ConversationStore } from "../src/openai-compat/backend.ts";
+import { SUMMARY_PREFIX } from "../src/openai-compat/compaction.ts";
 import { ok, type ToolBundle } from "../src/tool.ts";
 
 const usage = { inputTokens: { total: 120, noCache: 100, cacheRead: 20, cacheWrite: 0 }, outputTokens: { total: 7, text: 7, reasoning: undefined } };
@@ -37,13 +38,19 @@ function scripted(...steps: LanguageModelV4StreamPart[][]): MockLanguageModelV4 
   return new MockLanguageModelV4({ doStream: steps.map((chunks) => ({ stream: convertArrayToReadableStream(chunks) })) });
 }
 
-function memoryStore(): ConversationStore & { all: Map<string, ModelMessage[]> } {
+function memoryStore(): ConversationStore & { all: Map<string, ModelMessage[]>; compactions: number } {
   const all = new Map<string, ModelMessage[]>();
-  return {
+  const store = {
     all,
-    load: async (id) => [...(all.get(id) ?? [])],
-    append: async (id, msgs) => void all.set(id, [...(all.get(id) ?? []), ...msgs]),
+    compactions: 0,
+    load: async (id: string) => [...(all.get(id) ?? [])],
+    append: async (id: string, msgs: ModelMessage[]) => void all.set(id, [...(all.get(id) ?? []), ...msgs]),
+    compact: async (id: string, msgs: ModelMessage[]) => {
+      store.compactions++;
+      all.set(id, [...msgs]);
+    },
   };
+  return store;
 }
 
 const echo: ToolBundle = {
@@ -241,6 +248,222 @@ describe("OpenAICompatBackend", () => {
   test("no model named and no default is an error before any call", async () => {
     const b = new OpenAICompatBackend({ provider: { name: "p", baseURL: "http://x" }, store: memoryStore(), model: () => scripted(says("x")) });
     await expect(b.run({ prompt: "x", tools: [] }, {})).rejects.toThrow(/no model named/);
+  });
+});
+
+describe("compaction in the loop", () => {
+  const big = "output line ".repeat(400); // ~1.2k tokens a result
+  const bigTool: ToolBundle = { serverName: "ws", tools: [{ name: "cat", description: "", inputSchema: {}, handler: async () => ok(big) }] };
+  /** A model that calls `cat` `n` times, then answers. */
+  const steps = (n: number, answer: string) => [...Array.from({ length: n }, (_, i) => calls("ws__cat", {}, `c${answer}${i}`)), says(answer)];
+  /**
+   * Like `scripted`, but each call reports the prompt it was sent as its input usage (about four characters
+   * a token), as a real endpoint would: the loop trusts what the endpoint measured.
+   */
+  const measuring = (...script: LanguageModelV4StreamPart[][]): MockLanguageModelV4 => {
+    let i = 0;
+    return new MockLanguageModelV4({
+      doStream: async (options) => {
+        const tokens = Math.ceil(JSON.stringify(options.prompt).length / 4);
+        const chunks = script[i++]!.map((c) =>
+          c.type === "finish" ? { ...c, usage: { inputTokens: { total: tokens, noCache: tokens, cacheRead: 0, cacheWrite: 0 }, outputTokens: { total: 10, text: 10, reasoning: undefined } } } : c,
+        );
+        return { stream: convertArrayToReadableStream(chunks) };
+      },
+    });
+  };
+  const compacting = (store: ReturnType<typeof memoryStore>, model: MockLanguageModelV4, contextWindow: number, extra: object = {}) =>
+    new OpenAICompatBackend({
+      provider: { name: "local", baseURL: "http://x" },
+      store,
+      defaultModel: "m1",
+      newId: () => "conv-1",
+      model: () => model,
+      compaction: { contextWindow, keepRecentSteps: 2 },
+      ...extra,
+    });
+
+  test("under the threshold nothing is rewritten: every request's prefix is the previous request, unchanged", async () => {
+    const store = memoryStore();
+    const model = measuring(...steps(4, "done"));
+    await compacting(store, model, 1_000_000).run({ prompt: "read it all", systemPrompt: "sys", tools: [bigTool] }, {});
+    expect(store.compactions).toBe(0);
+    for (let i = 1; i < model.doStreamCalls.length; i++) {
+      const before = model.doStreamCalls[i - 1]!.prompt;
+      const now = model.doStreamCalls[i]!.prompt;
+      expect(JSON.stringify(now.slice(0, before.length))).toBe(JSON.stringify(before)); // the cache's whole condition
+    }
+  });
+
+  test("past the threshold the history is compacted once, stored, reported, and the next turn starts from it", async () => {
+    const store = memoryStore();
+    const reports: unknown[] = [];
+    // ~8 results of ~1.2k tokens against a 10k window: the threshold (7.5k) is crossed mid-turn.
+    const model = measuring(...steps(8, "first done"));
+    await compacting(store, model, 10_000, { onCompaction: (r: unknown) => reports.push(r) }).run({ prompt: "read it all", tools: [bigTool] }, {});
+    expect(store.compactions).toBe(1);
+    expect(reports).toHaveLength(1);
+    expect(reports[0]).toMatchObject({ summarized: false }); // pruning old outputs was enough
+    const kept = store.all.get("conv-1")!;
+    expect(unansweredCalls(kept)).toEqual([]);
+    expect(JSON.stringify(kept)).toContain("omitted to save context");
+    // The next turn loads the compacted history: no compaction again just for starting.
+    const next = measuring(says("second done"));
+    await compacting(store, next, 10_000).continueRun({ prompt: "and now?", tools: [bigTool], backendSessionId: "conv-1" }, {});
+    expect(store.compactions).toBe(1);
+    expect(JSON.stringify(next.doStreamCalls[0]!.prompt)).toContain("omitted to save context");
+  });
+
+  test("when pruning is not enough, the summary model writes the summary", async () => {
+    const store = memoryStore();
+    // History whose bulk is what pruning cannot shorten: long user messages.
+    await store.append("conv-1", [
+      { role: "user", content: "u".repeat(30_000) },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      { role: "user", content: "v".repeat(30_000) },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    ]);
+    const summarizer = new MockLanguageModelV4({
+      doGenerate: { content: [{ type: "text", text: "what came before" }], finishReason: { unified: "stop", raw: undefined }, usage, warnings: [] },
+    });
+    const main = measuring(...steps(2, "done"));
+    const b = new OpenAICompatBackend({
+      provider: { name: "local", baseURL: "http://x" },
+      store,
+      defaultModel: "m1",
+      model: (id) => (id === "cheap" ? summarizer : main),
+      compaction: { contextWindow: 16_000, keepRecentSteps: 1, summaryModel: "cheap" },
+    });
+    await b.continueRun({ prompt: "go on", tools: [bigTool], backendSessionId: "conv-1" }, {});
+    expect(summarizer.doGenerateCalls).toHaveLength(1);
+    const kept = store.all.get("conv-1")!;
+    expect(kept[0]).toEqual({ role: "user", content: `${SUMMARY_PREFIX}\n\nwhat came before` });
+    expect(JSON.stringify(kept)).not.toContain("uuuuuuuuuu");
+    expect(unansweredCalls(kept)).toEqual([]);
+  });
+
+  test("an endpoint that reports no usage still compacts, on the estimate", async () => {
+    const store = memoryStore();
+    const silent = new MockLanguageModelV4({
+      doStream: steps(8, "done").map((chunks) => ({
+        stream: convertArrayToReadableStream(
+          chunks.map((c) => (c.type === "finish" ? { ...c, usage: { inputTokens: { total: undefined, noCache: undefined, cacheRead: undefined, cacheWrite: undefined }, outputTokens: { total: undefined, text: undefined, reasoning: undefined } } } : c)),
+        ),
+      })),
+    });
+    await compacting(store, silent, 10_000).run({ prompt: "read", tools: [bigTool] }, {});
+    expect(store.compactions).toBe(1);
+  });
+
+  test("a store without `compact`, or compaction off, never compacts", async () => {
+    const store = memoryStore();
+    const model = measuring(...steps(8, "done"));
+    await compacting(store, model, 10_000, { compaction: false }).run({ prompt: "read", tools: [bigTool] }, {});
+    expect(store.compactions).toBe(0);
+    const { compact: _dropped, ...plain } = memoryStore();
+    const noCompact = { ...plain, compactions: 0 } as unknown as ReturnType<typeof memoryStore>;
+    await compacting(noCompact, measuring(...steps(8, "done")), 10_000).run({ prompt: "read", tools: [bigTool] }, {});
+    expect(noCompact.all.get("conv-1")!.length).toBeGreaterThan(8); // ran, appended, never compacted
+  });
+
+  test("a chat-only session compacts on what the previous turn MEASURED, not only on the estimate", async () => {
+    // Short turns, no tools: each turn has a single step, so its first check is the only one.
+    const store = memoryStore();
+    for (let i = 0; i < 4; i++) {
+      await store.append("conv-1", [
+        { role: "user", content: `question ${i} ${"q".repeat(3000)}` },
+        { role: "assistant", content: [{ type: "text", text: `answer ${i}` }] },
+      ]);
+    }
+    // One model that both answers (stream) and writes the summary (generate).
+    const answering = () =>
+      new MockLanguageModelV4({
+        doStream: { stream: convertArrayToReadableStream(says("ok")) },
+        doGenerate: { content: [{ type: "text", text: "the earlier questions" }], finishReason: { unified: "stop", raw: undefined }, usage, warnings: [] },
+      });
+    const run = (contextTokens?: number) =>
+      compacting(store, answering(), 10_000, { compaction: { contextWindow: 10_000, keepRecentSteps: 1 } }).continueRun(
+        { prompt: "next", tools: [], backendSessionId: "conv-1", ...(contextTokens ? { contextTokens } : {}) },
+        {},
+      );
+    await run(); // the estimate alone (~3.2k) is under the threshold
+    expect(store.compactions).toBe(0);
+    await run(9_000); // what the endpoint measured last turn is over it
+    expect(store.compactions).toBe(1);
+  });
+
+  test("a summary call that fails falls back to the pruned history; the turn runs, and the report says why", async () => {
+    const store = memoryStore();
+    await store.append("conv-1", [
+      { role: "user", content: "u".repeat(30_000) },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+      { role: "user", content: "v".repeat(30_000) },
+      { role: "assistant", content: [{ type: "text", text: "ok" }] },
+    ]);
+    const broken = new MockLanguageModelV4({
+      doGenerate: async () => {
+        throw new Error("summary endpoint 500");
+      },
+    });
+    const main = measuring(says("still answered"));
+    const reports: Array<{ summaryError?: string }> = [];
+    const r = await new OpenAICompatBackend({
+      provider: { name: "local", baseURL: "http://x" },
+      store,
+      defaultModel: "m1",
+      model: (id) => (id === "cheap" ? broken : main),
+      compaction: { contextWindow: 16_000, keepRecentSteps: 1, summaryModel: "cheap" },
+      onCompaction: (rep) => reports.push(rep),
+    }).continueRun({ prompt: "go on", tools: [], backendSessionId: "conv-1" }, {});
+    expect(r.text).toBe("still answered");
+    expect(main.doStreamCalls).toHaveLength(1);
+    expect(reports[0]?.summaryError).toContain("summary endpoint 500");
+  });
+
+  test("a failed attempt is not retried at every step of the turn", async () => {
+    const store = memoryStore();
+    let summaries = 0;
+    const broken = new MockLanguageModelV4({
+      doGenerate: async () => {
+        summaries++;
+        throw new Error("down");
+      },
+    });
+    await store.append("conv-1", [{ role: "user", content: "u".repeat(60_000) }, { role: "assistant", content: [{ type: "text", text: "ok" }] }]);
+    const main = measuring(...steps(4, "done"));
+    await new OpenAICompatBackend({
+      provider: { name: "local", baseURL: "http://x" },
+      store,
+      defaultModel: "m1",
+      model: (id) => (id === "cheap" ? broken : main),
+      compaction: { contextWindow: 16_000, keepRecentSteps: 8, summaryModel: "cheap" },
+    }).continueRun({ prompt: "go", tools: [bigTool], backendSessionId: "conv-1" }, {});
+    expect(main.doStreamCalls).toHaveLength(5);
+    expect(summaries).toBeLessThanOrEqual(1);
+  });
+
+  test("a host compactor's result that an endpoint would refuse is not stored, and the turn goes on", async () => {
+    const store = memoryStore();
+    const reports: Array<{ rejected?: string }> = [];
+    const orphan: ModelMessage[] = [{ role: "tool", content: [{ type: "tool-result", toolCallId: "ghost", toolName: "t", output: { type: "text", value: "x" } }] }];
+    const r = await compacting(store, measuring(...steps(8, "done")), 10_000, {
+      compaction: { contextWindow: 10_000, keepRecentSteps: 2, compactor: async () => orphan },
+      onCompaction: (rep: { rejected?: string }) => reports.push(rep),
+    }).run({ prompt: "read", tools: [bigTool] }, {});
+    expect(r.text).toBe("done");
+    expect(store.compactions).toBe(0);
+    expect(reports[0]?.rejected).toMatch(/no earlier message calls/);
+  });
+
+  test("across turns, and after a reload from the store, each request's prefix is the last one's, unchanged", async () => {
+    const store = memoryStore();
+    const first = measuring(...steps(2, "one"));
+    await compacting(store, first, 1_000_000).run({ prompt: "first", systemPrompt: "sys", tools: [bigTool] }, {});
+    const second = measuring(...steps(2, "two"));
+    await compacting(store, second, 1_000_000).continueRun({ prompt: "second", systemPrompt: "sys", tools: [bigTool], backendSessionId: "conv-1" }, {});
+    const last = first.doStreamCalls.at(-1)!.prompt;
+    const next = second.doStreamCalls[0]!.prompt;
+    expect(JSON.stringify(next.slice(0, last.length))).toBe(JSON.stringify(last));
   });
 });
 

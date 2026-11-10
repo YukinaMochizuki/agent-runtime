@@ -1,10 +1,12 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { isStepCount, streamText, tool, type LanguageModel, type ModelMessage, type ToolResultPart, type ToolSet } from "ai";
+import { generateText, isStepCount, streamText, tool, type LanguageModel, type ModelMessage, type ToolResultPart, type ToolSet } from "ai";
 import { z } from "zod";
 import type { AdapterContinueInput, AdapterRunInput, AdapterRunOptions, AdapterRunResult, BackendAdapter, TurnUsage } from "../adapter.ts";
 import { runAtBoundary, type ToolBoundary } from "../boundary.ts";
 import type { EffortLevel } from "../effort.ts";
 import type { ToolBundle, ToolDef, ToolResult } from "../tool.ts";
+import { withCacheBreakpoints } from "./cache.ts";
+import { defaultCompactor, estimateTokens, SUMMARY_INSTRUCTIONS, TOOL_IMAGES_PREFIX, type CompactionOptions } from "./compaction.ts";
 
 /**
  * A driver for any OpenAI-compatible chat API, with the agent loop written HERE rather than handed to a
@@ -32,6 +34,51 @@ export interface ConversationStore {
   load(conversationId: string): Promise<ModelMessage[]>;
   /** Append messages, in order, as they are produced. */
   append(conversationId: string, messages: ModelMessage[]): Promise<void>;
+  /**
+   * From now on the conversation IS `messages` (a compacted version of it), and later appends follow it.
+   * Optional: a store without it never has its history compacted. A host may keep what it replaced (for an
+   * audit, or to show a human); `load` must not return it.
+   */
+  compact?(conversationId: string, messages: ModelMessage[]): Promise<void>;
+}
+
+/** What a compaction did, for a host to tell a human. */
+export interface CompactionReport {
+  /** Estimated context before and after, in tokens. */
+  beforeTokens: number;
+  afterTokens: number;
+  /** True when the older part was summarized by the model, not only pruned. */
+  summarized: boolean;
+  /** What the summary call cost (its input + output tokens), when there was one. */
+  summaryTokens?: number;
+  /** The summary was wanted but its call failed: the history was pruned instead. */
+  summaryError?: string;
+  /** The compactor's result was not a history an endpoint would take; nothing was changed. */
+  rejected?: string;
+}
+
+/**
+ * Why `messages` would be refused by an OpenAI-compatible endpoint, or null when it would not: every tool
+ * result answers a call made earlier, with nothing but tool messages between the call and it, and every
+ * call is answered.
+ */
+export function malformedHistory(messages: ModelMessage[]): string | null {
+  const calledAt = new Map<string, number>();
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]!;
+    if (m.role === "assistant" && typeof m.content !== "string") {
+      for (const p of m.content) if (p.type === "tool-call") calledAt.set(p.toolCallId, i);
+    } else if (m.role === "tool") {
+      for (const p of m.content) {
+        if (p.type !== "tool-result") continue;
+        const at = calledAt.get(p.toolCallId);
+        if (at === undefined) return `a result for ${p.toolCallId}, which no earlier message calls`;
+        if (messages.slice(at + 1, i).some((x) => x.role !== "tool")) return `the result for ${p.toolCallId} does not follow its call directly`;
+      }
+    }
+  }
+  const open = unansweredCalls(messages);
+  return open.length ? `${open.length} call(s) without a result, first ${open[0]!.toolCallId}` : null;
 }
 
 /** One OpenAI-compatible endpoint. */
@@ -41,6 +88,12 @@ export interface OpenAICompatProvider {
   baseURL: string;
   apiKey?: string;
   headers?: Record<string, string>;
+  /**
+   * Mark prompt-cache breakpoints (`cache_control`) on the wire, for an endpoint that caches only up to a
+   * marker (Anthropic or Gemini models through OpenRouter, ...). Endpoints that cache a prefix by
+   * themselves (OpenAI, DeepSeek) need nothing: the loop keeps the prefix stable. See cache.ts.
+   */
+  cacheBreakpoints?: boolean;
 }
 
 export interface OpenAICompatBackendOptions {
@@ -64,6 +117,13 @@ export interface OpenAICompatBackendOptions {
    * the tool results; when it does not (or it is not known), it is dropped with a note in the result.
    */
   vision?: boolean;
+  /**
+   * Keep the conversation inside the model's context window (compaction.ts). Absent or false: never
+   * compacted, as before. Needs the store's `compact`.
+   */
+  compaction?: CompactionOptions | false;
+  /** Told after each compaction, e.g. to note it in a transcript. */
+  onCompaction?: (report: CompactionReport) => void;
   /** Test seam: the model for an id (default: the provider's chat model). */
   model?: (modelId: string) => LanguageModel;
 }
@@ -141,7 +201,14 @@ export class OpenAICompatBackend implements BackendAdapter {
   constructor(private readonly opts: OpenAICompatBackendOptions) {
     if (opts.model) this.chat = opts.model;
     else {
-      const p = createOpenAICompatible({ name: opts.provider.name, baseURL: opts.provider.baseURL, apiKey: opts.provider.apiKey, headers: opts.provider.headers, includeUsage: true });
+      const p = createOpenAICompatible({
+        name: opts.provider.name,
+        baseURL: opts.provider.baseURL,
+        apiKey: opts.provider.apiKey,
+        headers: opts.provider.headers,
+        includeUsage: true,
+        ...(opts.provider.cacheBreakpoints ? { transformRequestBody: withCacheBreakpoints } : {}),
+      });
       this.chat = (id) => p.chatModel(id);
     }
   }
@@ -185,9 +252,30 @@ export class OpenAICompatBackend implements BackendAdapter {
     let usage: TurnUsage = { model: modelId, costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
     let text = "";
     const maxSteps = this.opts.maxSteps ?? DEFAULT_MAX_STEPS;
+    // What the last request measured: its whole prompt plus its output, and how many messages that was.
+    // The estimate before the next call starts from it, so a rough count only covers what was added since.
+    // At a turn's start that is what the host says the previous turn ended at (`contextTokens`): the history
+    // loaded is exactly what that request measured, so the first check of the turn does not rest on the
+    // rough estimate alone, which is all a one-step chat turn would ever get.
+    const carried = (input as Partial<AdapterContinueInput>).contextTokens;
+    let measured: { tokens: number; messages: number } | null = carried && carried > 0 ? { tokens: carried, messages: history.length } : null;
+    // The fixed part of every request, which the history estimate does not see.
+    const overhead = estimateTokens([{ role: "user", content: (input.systemPrompt ?? "") + JSON.stringify(Object.values(tools).map((t) => t.description)) }]);
+    let compactedAt = -1; // the history length right after this turn's last compaction ATTEMPT
     for (let step = 0; ; step++) {
       signal?.throwIfAborted();
       if (step >= maxSteps) throw new Error(`stopped after ${maxSteps} model calls in one turn without a final answer`);
+      const used = measured ? measured.tokens + estimateTokens(messages.slice(measured.messages)) : overhead + estimateTokens(messages);
+      const attempt = await this.compactIfNeeded(id, messages, used, model, compactedAt, signal);
+      if (attempt) {
+        // An attempt that changed nothing (nothing to cut, a summary that failed, a result refused) counts
+        // too: trying again at the very next step would only pay for the same summary again.
+        if (attempt.next) {
+          messages.splice(0, messages.length, ...attempt.next);
+          measured = null;
+        }
+        compactedAt = messages.length;
+      }
       const result = streamText({
         model,
         ...(input.systemPrompt ? { instructions: input.systemPrompt } : {}),
@@ -239,6 +327,11 @@ export class OpenAICompatBackend implements BackendAdapter {
         cacheCreationTokens: u.inputTokenDetails?.cacheWriteTokens ?? 0,
       };
       const response = finalStep.response.messages as ModelMessage[];
+      // An endpoint that reports no usage leaves the rough estimate in charge, rather than a zero that
+      // would read as an empty context and never compact.
+      // Input usage, not just output: an endpoint reporting only its output would otherwise read as a
+      // context of a few tokens.
+      measured = (u.inputTokens ?? 0) > 0 ? { tokens: (u.inputTokens ?? 0) + (u.outputTokens ?? 0), messages: messages.length + response.length } : null;
       await keep(response);
       const calls = finalStep.toolCalls;
       if (!calls.length) {
@@ -292,7 +385,7 @@ export class OpenAICompatBackend implements BackendAdapter {
           {
             role: "user",
             content: [
-              { type: "text", text: `The ${images.length === 1 ? "image" : `${images.length} images`} returned by the tool calls above:` },
+              { type: "text", text: `${TOOL_IMAGES_PREFIX} (${images.length}):` },
               ...images.map((i) => ({ type: "file" as const, data: i.data, mediaType: i.mediaType })),
             ],
           },
@@ -301,6 +394,74 @@ export class OpenAICompatBackend implements BackendAdapter {
       if (stopped !== null) throw stopped;
     }
     return { text: text.trim(), backendSessionId: id, usage };
+  }
+
+  /**
+   * Compact when the context is past the threshold: the compacted history, already stored, or null.
+   *
+   * Not again in the same turn until the agent has taken enough new steps to be worth it: a history the
+   * compactor cannot get under the threshold (a huge current step) would otherwise be compacted, and pay for
+   * a summary, before every single call.
+   */
+  private async compactIfNeeded(id: string, messages: ModelMessage[], used: number, model: LanguageModel, compactedAt: number, signal: AbortSignal | undefined): Promise<{ next: ModelMessage[] | null } | null> {
+    const c = this.opts.compaction;
+    if (!c || !this.opts.store.compact) return null;
+    const threshold = c.threshold ?? 0.75;
+    const keepRecentSteps = c.keepRecentSteps ?? 8;
+    if (used <= c.contextWindow * threshold) return null;
+    if (compactedAt >= 0 && messages.slice(compactedAt).filter((m) => m.role === "assistant").length < keepRecentSteps) return null;
+    let summarized = false;
+    let summaryError: string | undefined;
+    let summaryTokens = 0;
+    const next = await (c.compactor ?? defaultCompactor)({
+      messages,
+      usedTokens: used,
+      contextWindow: c.contextWindow,
+      target: c.target ?? 0.5,
+      keepRecentSteps,
+      summarize: async (transcript) => {
+        try {
+          const r = await generateText({
+            model: c.summaryModel ? this.chat(c.summaryModel) : model,
+            instructions: SUMMARY_INSTRUCTIONS,
+            prompt: transcript,
+            ...(signal ? { abortSignal: signal } : {}),
+          });
+          summarized = true;
+          summaryTokens = (r.usage.inputTokens ?? 0) + (r.usage.outputTokens ?? 0);
+          return r.text;
+        } catch (e) {
+          // A stop is a stop. Anything else (the summary endpoint down, a wrong summary model, a
+          // transcript too long for a smaller one) must not fail a turn whose request would still fit:
+          // answer "" and the compactor keeps what pruning got.
+          if (signal?.aborted) throw e;
+          summaryError = e instanceof Error ? e.message : String(e);
+          return "";
+        }
+      },
+    });
+    if (!next) {
+      // Nothing changed, but a summary that failed is still news: the context stays over its threshold.
+      if (summaryError) this.opts.onCompaction?.({ beforeTokens: used, afterTokens: used, summarized: false, summaryError });
+      return { next: null };
+    }
+    // A compacted history is stored for good, so it must be one an endpoint will take: a host's compactor
+    // is checked as strictly as the default (which never trips this).
+    const problem = malformedHistory(next);
+    if (problem) {
+      this.opts.onCompaction?.({ beforeTokens: used, afterTokens: used, summarized: false, rejected: problem });
+      return { next: null };
+    }
+    await this.opts.store.compact(id, next);
+    const scale = used / Math.max(1, estimateTokens(messages));
+    this.opts.onCompaction?.({
+      beforeTokens: used,
+      afterTokens: Math.round(estimateTokens(next) * scale),
+      summarized,
+      ...(summaryTokens ? { summaryTokens } : {}),
+      ...(summaryError ? { summaryError } : {}),
+    });
+    return { next };
   }
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any

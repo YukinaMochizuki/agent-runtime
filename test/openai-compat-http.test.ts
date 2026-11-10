@@ -118,6 +118,18 @@ describe("OpenAICompatBackend over HTTP", () => {
     expect(parts.some((p) => p.type === "image_url" && p.image_url!.url.startsWith("data:image/png;base64,iVBORw0KGgo="))).toBe(true);
   });
 
+  test("with cache breakpoints on, the system prompt and the last message carry cache_control on the wire; off, nothing does", async () => {
+    const provider = { name: "fake", baseURL: `http://localhost:${server.port}/v1`, apiKey: "sk-fake" };
+    requests.length = 0;
+    await new OpenAICompatBackend({ provider: { ...provider, cacheBreakpoints: true }, store: memoryStore(), defaultModel: "fake-1" }).run({ prompt: "hello", systemPrompt: "Be terse.", tools: [] }, {});
+    const marked = requests[0]!.messages;
+    expect(marked[0]!.content).toEqual([{ type: "text", text: "Be terse.", cache_control: { type: "ephemeral" } }]);
+    expect(JSON.stringify(marked[marked.length - 1]!.content)).toContain("cache_control");
+    requests.length = 0;
+    await new OpenAICompatBackend({ provider, store: memoryStore(), defaultModel: "fake-1" }).run({ prompt: "hello", systemPrompt: "Be terse.", tools: [] }, {});
+    expect(JSON.stringify(requests[0]!.messages)).not.toContain("cache_control");
+  });
+
   test("an endpoint's error status fails the turn", async () => {
     const b = new OpenAICompatBackend({ provider: { name: "fake", baseURL: `http://localhost:${server.port}/nope` }, store: memoryStore(), defaultModel: "fake-1" });
     await expect(b.run({ prompt: "x", tools: [] }, {})).rejects.toThrow();
