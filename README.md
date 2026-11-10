@@ -1,1 +1,86 @@
 # agent-runtime
+
+The agent runtime shared by [workstream](https://github.com/YukinaMochizuki/workstream) and other hosts:
+the drivers that run an agent's turn, the tool layer they all consume, and the tool boundary every tool
+call passes through. A host brings its own tools, its own store and its own policy; this package owns the
+parts that are the same for every host and that took real use to get right.
+
+No store, no UI, no product concepts live here. Where a driver needs one (a conversation's history, a
+transcript row, a message to deliver mid-turn), it asks the host through a small interface.
+
+## What is in it
+
+```
+agent-runtime            the contract and the tool layer
+  adapter.ts             BackendAdapter: one TURN per call (run / continueRun), streamed through callbacks
+  tool.ts                ToolDef / ToolBundle / ToolResult: what a tool IS, independent of any SDK
+  boundary.ts            the tool boundary: what runs around every call, in a fixed order
+  effort.ts              the neutral reasoning-effort vocabulary
+agent-runtime/claude     the Claude Agent SDK driver
+agent-runtime/openai-compat
+                         any OpenAI-compatible endpoint, on an agent loop written here
+```
+
+### The tool boundary
+
+Every driver passes every tool call through one `ToolBoundary`, so a host's policy behaves the same
+whichever model runs. The order is fixed:
+
+```
+refuse? ──yes──▶ the refusal IS the result (recorded; the handler never runs)
+   │no
+record start ─▶ run the handler (inside the host's per-call context) ─▶ record end ─▶ append
+                                       │throws
+                                       └──▶ record the throw, re-throw
+```
+
+`append` is how a running turn hears about something that arrived while it worked: the host returns
+text (e.g. its inbox), and it reaches the model as a separate block after the tool's own result, at the
+next tool call rather than after the turn ends. Recording is best-effort and never breaks the call.
+
+### The Claude driver (`agent-runtime/claude`)
+
+The Claude Agent SDK, with the lessons that cost something to learn baked into its options:
+built-in tools hidden by default (`tools: []`; a host can name some), no settings files read, the
+claude.ai account's connectors switched off, thinking summaries requested so newer models' progress
+updates between tool calls reach the host, the session id surfaced from the first message (so an
+interrupted turn is resumable), context usage taken from the last request rather than the turn's sum,
+and Claude Code's non-streaming fallback replayed without duplicating what already streamed. Which login
+a turn runs on is a `configDir` (`CLAUDE_CONFIG_DIR`); choosing among several is the host's policy.
+
+### The OpenAI-compatible driver (`agent-runtime/openai-compat`)
+
+The AI SDK (`ai`, `@ai-sdk/openai-compatible`) makes ONE model call per step (`streamText`, tools without
+`execute`); the loop around it is this package's: each tool call goes through the same boundary as on
+Claude, a stop is honoured between steps, and the conversation is the host's (`ConversationStore`),
+appended as it is produced so a crash loses at most the step in flight. The system prompt is sent every
+turn, never stored. Reasoning effort is sent as `reasoning_effort` only at the levels an endpoint has a
+name for (low / medium / high).
+
+## Using it
+
+It is consumed as TypeScript source (both hosts run Bun); there is no build step. Pin a commit:
+
+```jsonc
+// package.json
+"dependencies": { "agent-runtime": "github:YukinaMochizuki/agent-runtime#<sha>" }
+```
+
+`zod` and `@anthropic-ai/claude-agent-sdk` are peer dependencies: the host's copies are used, so a tool's
+schema and the SDK's are the same instances.
+
+## Developing it
+
+```bash
+bun install
+bun run typecheck
+bun test
+bun scripts/verify-claude-fake.ts   # the Claude driver through the real CLI, against a fake API
+```
+
+The unit tests drive the OpenAI-compatible driver against both a mock model and a fake HTTP endpoint;
+the script is the Claude driver's equivalent, a real Claude Code subprocess with no login or quota.
+
+A change here is a change to every host. Before pinning a new commit in a host, run that host's own
+typecheck and tests against it (in workstream: point `agent-runtime` at a local checkout with
+`file:<path>`, `bun install`, then `bun run typecheck && bun test`).
