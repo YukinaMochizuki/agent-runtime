@@ -113,6 +113,13 @@ export interface RunClaudeAgentInput {
   /** Text, or text and images (sent as one user message of content blocks; see `claudePrompt`). */
   prompt: Prompt;
   systemPrompt?: string;
+  /**
+   * `false`: Claude Code renders `systemPrompt` fresh on every request instead of recording it in the
+   * session and replaying the record. A resume then sends the prompt it is given, not the one the
+   * conversation started with (by default a recorded prompt is kept until compaction, and a
+   * `--system-prompt` passed on resume is ignored). Absent: Claude Code's default (recorded).
+   */
+  systemPromptSnapshot?: boolean;
   /** Absent: the SDK's own default. A host with a configured default passes it here. */
   model?: string;
   /** How hard the model should think. Absent leaves the model's own default (not the same as any level). */
@@ -170,7 +177,9 @@ export function claudeQueryOptions(input: RunClaudeAgentInput): Options {
     ...(input.onToken || input.onTool || input.onToolDraft ? { includePartialMessages: true } : {}),
     ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
-    ...(input.systemPrompt ? { systemPrompt: input.systemPrompt } : {}),
+    ...(input.systemPrompt
+      ? { systemPrompt: input.systemPromptSnapshot === false ? { type: "custom" as const, prompt: input.systemPrompt, snapshot: false } : input.systemPrompt }
+      : {}),
     ...(input.resumeSessionId ? { resume: input.resumeSessionId } : {}),
     ...(input.forkSession ? { forkSession: true } : {}),
   };

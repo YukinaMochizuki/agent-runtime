@@ -71,6 +71,9 @@ updates between tool calls reach the host, the session id surfaced from the firs
 interrupted turn is resumable), context usage taken from the last request rather than the turn's sum,
 and Claude Code's non-streaming fallback replayed without duplicating what already streamed. Which login
 a turn runs on is a `configDir` (`CLAUDE_CONFIG_DIR`); choosing among several is the host's policy.
+Claude Code records a conversation's system prompt and replays it on every resume, ignoring a new one; a
+host whose prompt changes mid-conversation sets `liveSystemPrompt`, and each turn's prompt is then sent
+fresh (an edit costs the prompt cache once).
 
 ### The OpenAI-compatible driver (`agent-runtime/openai-compat`)
 

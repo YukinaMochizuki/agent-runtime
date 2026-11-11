@@ -40,7 +40,7 @@ const check = (cond: unknown, m: string) => (cond ? log(`ok  ${m}`) : fail(m));
 
 type Block = { type: string; text?: string; content?: unknown; tool_use_id?: string; source?: { type?: string; media_type?: string; data?: string } };
 type Msg = { role: string; content: string | Block[] };
-const seen: Array<{ path: string; messages?: Msg[]; tools?: Array<{ name: string }> }> = [];
+const seen: Array<{ path: string; system?: string; messages?: Msg[]; tools?: Array<{ name: string }> }> = [];
 
 const ev = (type: string, data: unknown) => `event: ${type}\ndata: ${JSON.stringify({ type, ...(data as object) })}\n\n`;
 function stream(id: string, blocks: Array<{ type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: unknown }>, stop: string): Response {
@@ -64,8 +64,8 @@ const fake = Bun.serve({
   port: 0,
   async fetch(req) {
     const url = new URL(req.url);
-    const body = req.method === "POST" ? ((await req.json().catch(() => ({}))) as { messages?: Msg[]; tools?: Array<{ name: string }>; stream?: boolean }) : {};
-    seen.push({ path: url.pathname, messages: body.messages, tools: body.tools });
+    const body = req.method === "POST" ? ((await req.json().catch(() => ({}))) as { system?: unknown; messages?: Msg[]; tools?: Array<{ name: string }>; stream?: boolean }) : {};
+    seen.push({ path: url.pathname, system: JSON.stringify(body.system ?? ""), messages: body.messages, tools: body.tools });
     if (url.pathname.endsWith("/count_tokens")) return Response.json({ input_tokens: 10 });
     if (!url.pathname.endsWith("/v1/messages")) return Response.json({});
     const last = body.messages?.[body.messages.length - 1];
@@ -74,6 +74,7 @@ const fake = Bun.serve({
     const hasTool = body.tools?.some((t) => t.name === "mcp__ws__echo");
     if (!hasTool) return stream("msg_side", [{ type: "text", text: "ok" }], "end_turn"); // the CLI's own side requests
     if (JSON.stringify(last).includes("SECOND TURN")) return stream("msg_3", [{ type: "text", text: "Seen again." }], "end_turn");
+    if (JSON.stringify(body.messages).includes("once more")) return stream("msg_3", [{ type: "text", text: "Again." }], "end_turn"); // the system-prompt resumes below
     if (result) return stream("msg_2", [{ type: "text", text: `Done: ${JSON.stringify(result.content)}` }], "end_turn");
     return stream("msg_1", [{ type: "text", text: "Echoing." }, { type: "tool_use", id: "toolu_1", name: "mcp__ws__echo", input: { text: "hello" } }], "tool_use");
   },
@@ -159,6 +160,17 @@ try {
     { signal: ac.signal },
   );
   check(bare.text === "ok", `a prompt of parts runs with no tools too (${JSON.stringify(bare.text)})`);
+
+  // A resume keeps the conversation's recorded system prompt by default; with liveSystemPrompt the
+  // turn's own prompt replaces it, and the conversation's history is still there.
+  const lastMain = () => seen.filter((s) => s.path.endsWith("/v1/messages") && s.tools?.some((t) => t.name === "mcp__ws__echo")).at(-1)!;
+  await backend.continueRun({ backendSessionId: sid, prompt: "echo once more", systemPrompt: "You are an edited test.", tools: [echo] }, { signal: ac.signal });
+  check(lastMain().system!.includes("You are a test.") && !lastMain().system!.includes("edited"), "by default a resume keeps the system prompt the conversation began with");
+  const live = new ClaudeBackend({ defaultModel: "claude-sonnet-4-5", liveSystemPrompt: true });
+  await live.continueRun({ backendSessionId: sid, prompt: "and once more", systemPrompt: "You are an edited test.", tools: [echo] }, { signal: ac.signal });
+  const liveResumed = lastMain();
+  check(liveResumed.system!.includes("You are an edited test.") && !liveResumed.system!.includes("You are a test."), "with liveSystemPrompt a resume sends the turn's new system prompt");
+  check(JSON.stringify(liveResumed.messages).includes("please echo hello"), "and the resumed conversation keeps its history");
   log("PASS");
 } catch (e) {
   fail(`the turn threw: ${e instanceof Error ? e.message : String(e)}\nrequests: ${seen.map((s) => s.path).join(" ")}`);
