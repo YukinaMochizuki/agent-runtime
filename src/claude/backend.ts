@@ -16,6 +16,13 @@ export interface ClaudeBackendOptions {
   builtinTools?: string[];
   /** Each `rate_limit_event` of a turn. */
   onRateLimit?: (reading: RateLimitReading) => void;
+  /**
+   * The system prompt is the TURN's, not the conversation's: it is sent on `continueRun` too and rendered
+   * fresh on every request (`systemPromptSnapshot: false`), so a host that edits it mid-conversation is
+   * heard from the next turn on. An unchanged prompt sends the same bytes, so the prompt cache holds; a
+   * changed one costs the cache once. Default off: a resume keeps the prompt the conversation began with.
+   */
+  liveSystemPrompt?: boolean;
 }
 
 /**
@@ -44,8 +51,15 @@ export class ClaudeBackend implements BackendAdapter {
     const r = await runClaudeAgent({
       configDir: this.opts.configDir ?? null,
       prompt: input.prompt,
-      // The system prompt is the conversation's: a resume keeps the one it started with.
-      ...(input.systemPrompt && !resumeSessionId ? { systemPrompt: input.systemPrompt } : {}),
+      // By default the system prompt is the conversation's: a resume keeps the one it started with (Claude
+      // Code replays its recorded copy). With `liveSystemPrompt` it is the turn's: see the option.
+      ...(this.opts.liveSystemPrompt
+        ? input.systemPrompt
+          ? { systemPrompt: input.systemPrompt, systemPromptSnapshot: false }
+          : {}
+        : input.systemPrompt && !resumeSessionId
+          ? { systemPrompt: input.systemPrompt }
+          : {}),
       // The model is forwarded on a resume too: dropping it there moved a resumed conversation onto the
       // default model from turn two.
       model: input.model ?? this.opts.defaultModel,

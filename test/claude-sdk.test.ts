@@ -27,6 +27,11 @@ describe("claudeQueryOptions", () => {
     expect(o.model).toBeUndefined();
     expect(o.resume).toBe("s1");
   });
+
+  test("a system prompt is recorded by default, and rendered fresh with systemPromptSnapshot: false", () => {
+    expect(claudeQueryOptions({ prompt: "hi", systemPrompt: "S" }).systemPrompt).toBe("S");
+    expect(claudeQueryOptions({ prompt: "hi", systemPrompt: "S", systemPromptSnapshot: false }).systemPrompt).toEqual({ type: "custom", prompt: "S", snapshot: false });
+  });
 });
 
 describe("claudePrompt", () => {
