@@ -1,5 +1,5 @@
 import type { EffortLevel } from "./effort.ts";
-import type { ToolBundle } from "./tool.ts";
+import type { Prompt, ToolBundle } from "./tool.ts";
 
 /**
  * The backend-neutral driver contract. A host talks only to a BackendAdapter, so adding or swapping a
@@ -36,7 +36,11 @@ export interface AdapterRunOptions {
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 export interface AdapterRunInput<B extends ToolBundle<any> = ToolBundle> {
-  prompt: string;
+  /**
+   * The user message that opens the turn: text, or text and images in order (`PromptPart`). Images go to
+   * the model as images; a driver whose model cannot take them replaces each with a short note.
+   */
+  prompt: Prompt;
   /** Optional per-run system prompt; absent = the driver's default. */
   systemPrompt?: string;
   /** Optional per-run model; absent = the driver's configured default. */

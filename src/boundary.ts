@@ -1,4 +1,4 @@
-import type { ToolResult } from "./tool.ts";
+import type { ToolContent, ToolResult } from "./tool.ts";
 
 /**
  * The TOOL BOUNDARY: the one seam every driver passes each tool call through, and where a host runs what
@@ -11,8 +11,8 @@ import type { ToolResult } from "./tool.ts";
  *     long as it hangs), completed in place by `callId` when it returns, so parallel calls cannot
  *     mis-attribute; a thrown handler is recorded too, or a failed call vanishes from history;
  *   - runs the handler inside its own context (an async-local carrying the call's abort signal and id);
- *   - APPENDS to the result what arrived while the agent was working (messages to it), which is how a
- *     running turn hears about them at the next tool call instead of after the turn ends.
+ *   - APPENDS to the result what arrived while the agent was working (messages to it, pictures in them),
+ *     which is how a running turn hears about them at the next tool call instead of after the turn ends.
  *
  * The ORDER is fixed here and is the point of the module: refuse → record start → run → record end →
  * append. Every hook is optional, and every recording hook is best-effort: recording must never break,
@@ -45,9 +45,16 @@ export interface ToolBoundary<R extends ToolResult = any> {
   recordThrow?(call: ToolCall, error: unknown): Promise<void> | void;
   /** Run the handler inside the host's per-call context. Default: just run it. */
   around?<T>(call: ToolCall, fn: () => Promise<T>): Promise<T>;
-  /** Text to append to the result as a separate block (e.g. messages that arrived), or null. */
-  append?(call: ToolCall, result: R): Promise<string | null> | string | null;
+  /**
+   * What to append to the result, after the tool's own content (e.g. messages that arrived), or null: a
+   * text (one block), or blocks of text and images in order. Every driver delivers them after the tool's
+   * own result, as it delivers an image a tool returns.
+   */
+  append?(call: ToolCall, result: R): Promise<Appended> | Appended;
 }
+
+/** What `append` may return. */
+export type Appended = string | ToolContent[] | null;
 
 /** A fresh id tying a call's start row to its completion. */
 export const newCallId = (): string => crypto.randomUUID();
@@ -88,12 +95,13 @@ export async function runAtBoundary<R extends ToolResult>(
   }
   await quietly(() => b.recordEnd?.(started, res));
   // After the call's own record, so a transcript reads call → message.
-  let extra: string | null = null;
+  let extra: Appended = null;
   try {
     extra = b.append ? await b.append(started, res) : null;
   } catch {
     return res; // a hiccup in the host's inbox never breaks the call; it can deliver later
   }
-  if (!extra) return res;
-  return { ...res, content: [...(res.content ?? []), { type: "text", text: extra }] };
+  const blocks: ToolContent[] = typeof extra === "string" ? (extra ? [{ type: "text", text: extra }] : []) : (extra ?? []);
+  if (!blocks.length) return res;
+  return { ...res, content: [...(res.content ?? []), ...blocks] };
 }

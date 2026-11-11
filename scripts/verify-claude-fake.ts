@@ -2,14 +2,33 @@
  * The Claude driver end to end through the REAL Claude Code CLI, against a FAKE Anthropic Messages API on
  * localhost: no login, no quota. What the unit tests cannot see is the subprocess itself: that the
  * options this package passes are ones the CLI accepts, that a tool call reaches an in-process MCP tool
- * through the boundary, that the boundary's appended block reaches the model with the tool's result, and
- * that the session id, the prose and the usage come back.
+ * through the boundary, that the boundary's appended blocks (text and an image) reach the model with the
+ * tool's result, that a prompt of parts reaches it as content blocks (an image included) on a fresh run and
+ * on a resume, and that the session id, the prose and the usage come back.
  *
  *   bun scripts/verify-claude-fake.ts
  */
 import { z } from "zod";
 import { ClaudeBackend } from "../src/claude/index.ts";
-import { ok, type ToolBundle } from "../src/tool.ts";
+import { ok, type ToolBundle, type ToolContent } from "../src/tool.ts";
+
+// Three distinct, valid 1x1 PNGs (red, green, blue), so each check can tell WHICH image arrived where.
+const PROMPT_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGP4z8AAAAMBAQDJ/pLvAAAAAElFTkSuQmCC";
+const APPEND_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNg+M8AAAICAQB7CYF4AAAAAElFTkSuQmCC";
+const RESUME_PNG = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAADElEQVR4nGNgYPgPAAEDAQAIicLsAAAAAElFTkSuQmCC";
+/** Every base64 image block anywhere in `x` (a message list, a tool_result's content), by its data. */
+function imagesIn(x: unknown): string[] {
+  const out: string[] = [];
+  const walk = (v: unknown): void => {
+    if (Array.isArray(v)) return v.forEach(walk);
+    if (!v || typeof v !== "object") return;
+    const o = v as Block;
+    if (o.type === "image" && o.source?.type === "base64" && o.source.data) out.push(o.source.data);
+    Object.values(o).forEach(walk);
+  };
+  walk(x);
+  return out;
+}
 
 const t0 = Date.now();
 const log = (m: string) => console.log(`[+${((Date.now() - t0) / 1000).toFixed(1)}s] ${m}`);
@@ -19,7 +38,8 @@ const fail = (m: string): never => {
 };
 const check = (cond: unknown, m: string) => (cond ? log(`ok  ${m}`) : fail(m));
 
-type Msg = { role: string; content: string | Array<{ type: string; text?: string; content?: unknown; tool_use_id?: string }> };
+type Block = { type: string; text?: string; content?: unknown; tool_use_id?: string; source?: { type?: string; media_type?: string; data?: string } };
+type Msg = { role: string; content: string | Block[] };
 const seen: Array<{ path: string; messages?: Msg[]; tools?: Array<{ name: string }> }> = [];
 
 const ev = (type: string, data: unknown) => `event: ${type}\ndata: ${JSON.stringify({ type, ...(data as object) })}\n\n`;
@@ -53,6 +73,7 @@ const fake = Bun.serve({
     const result = blocks.find((b) => b.type === "tool_result");
     const hasTool = body.tools?.some((t) => t.name === "mcp__ws__echo");
     if (!hasTool) return stream("msg_side", [{ type: "text", text: "ok" }], "end_turn"); // the CLI's own side requests
+    if (JSON.stringify(last).includes("SECOND TURN")) return stream("msg_3", [{ type: "text", text: "Seen again." }], "end_turn");
     if (result) return stream("msg_2", [{ type: "text", text: `Done: ${JSON.stringify(result.content)}` }], "end_turn");
     return stream("msg_1", [{ type: "text", text: "Echoing." }, { type: "tool_use", id: "toolu_1", name: "mcp__ws__echo", input: { text: "hello" } }], "tool_use");
   },
@@ -72,7 +93,9 @@ const backend = new ClaudeBackend({
   boundary: {
     recordStart: (c) => void order.push(`start:${c.recordedName}`),
     recordEnd: () => void order.push("end"),
-    append: () => (order.push("append"), "[inbox] a message for you"),
+    append: (): ToolContent[] => (
+      order.push("append"), [{ type: "text", text: "[inbox] a message for you" }, { type: "image", data: APPEND_PNG, mimeType: "image/png" }]
+    ),
   },
 });
 
@@ -83,7 +106,14 @@ const ac = new AbortController();
 const timer = setTimeout(() => ac.abort(), 60_000);
 try {
   const r = await backend.run(
-    { prompt: "please echo hello", systemPrompt: "You are a test.", tools: [echo] },
+    {
+      prompt: [
+        { type: "text", text: "please echo hello" },
+        { type: "image", data: PROMPT_PNG, mimeType: "image/png" },
+      ],
+      systemPrompt: "You are a test.",
+      tools: [echo],
+    },
     { onToken: (t) => tokens.push(t), onTool: (n) => tools.push(n), onSessionId: (id) => (sid = id), signal: ac.signal },
   );
   log(`turn ended: ${JSON.stringify(r.text)}`);
@@ -92,12 +122,43 @@ try {
   check(order.join(",") === "start:echo,handler,end,append", `the boundary ran in order: ${order.join(",")}`);
   const second = seen.filter((s) => s.path.endsWith("/v1/messages") && s.tools?.some((t) => t.name === "mcp__ws__echo")).at(-1)!;
   const sent = JSON.stringify(second.messages);
-  check(sent.includes("echo: hello") && sent.includes("[inbox] a message for you"), "the tool result and the appended block reached the model");
+  check(sent.includes("echo: hello") && sent.includes("[inbox] a message for you"), "the tool result and the appended text reached the model");
+  const first = second.messages![0]!;
+  check(first.role === "user" && imagesIn(first).includes(PROMPT_PNG) && JSON.stringify(first).includes("please echo hello"), "the prompt's image reached the model as an image block, with its text, in the opening user message");
+  const toolResult = (second.messages!.at(-1)!.content as Block[]).find((b) => b.type === "tool_result")!;
+  const resultBlocks = JSON.stringify(toolResult.content);
+  check(
+    imagesIn(toolResult).includes(APPEND_PNG) && resultBlocks.indexOf("echo: hello") < resultBlocks.indexOf("[inbox]"),
+    "the appended image reached the model as an image block inside the tool result, after the tool's own text",
+  );
   check(r.text.startsWith("Done:"), "the final text is the last response's");
   check(tokens.join("").includes("Echoing."), "prose streamed through onToken");
   check(r.usage.outputTokens > 0, `usage came back (${JSON.stringify(r.usage)})`);
   const toolNames = new Set(seen.flatMap((s) => (s.tools ?? []).map((t) => t.name)));
   check(![...toolNames].some((n) => ["Bash", "Read", "Write", "Edit"].includes(n)), `no built-in tool was exposed (${[...toolNames].join(", ")})`);
+
+  // A resume whose prompt carries an image: the new user message must hold it as an image block, and the
+  // earlier images must still be in the resumed history (Claude Code keeps them in its session file).
+  const before = seen.length;
+  const r2 = await backend.continueRun(
+    { backendSessionId: sid, prompt: [{ type: "text", text: "SECOND TURN: and this one?" }, { type: "image", data: RESUME_PNG, mimeType: "image/png" }], tools: [echo] },
+    { signal: ac.signal },
+  );
+  log(`resumed turn ended: ${JSON.stringify(r2.text)}`);
+  check(r2.backendSessionId === sid && r2.text === "Seen again.", "the resume continued the same session");
+  const resumed = seen.slice(before).filter((s) => s.path.endsWith("/v1/messages") && s.tools?.some((t) => t.name === "mcp__ws__echo")).at(-1)!;
+  const lastUser = resumed.messages!.at(-1)!;
+  check(lastUser.role === "user" && imagesIn(lastUser).includes(RESUME_PNG), "on a resume, the prompt's image reached the model as an image block in the new user message");
+  const kept = imagesIn(resumed.messages!.slice(0, -1));
+  check(kept.includes(PROMPT_PNG) && kept.includes(APPEND_PNG), `on a resume, the earlier turn's images are still in the history sent (${kept.length} image block(s))`);
+
+  // With no tools there is no in-process MCP server, so the SDK closes the CLI's input right after the
+  // one message instead of waiting for the result: the turn must still run.
+  const bare = await new ClaudeBackend({ defaultModel: "claude-sonnet-4-5" }).run(
+    { prompt: [{ type: "text", text: "no tools here" }, { type: "image", data: PROMPT_PNG, mimeType: "image/png" }], tools: [] },
+    { signal: ac.signal },
+  );
+  check(bare.text === "ok", `a prompt of parts runs with no tools too (${JSON.stringify(bare.text)})`);
   log("PASS");
 } catch (e) {
   fail(`the turn threw: ${e instanceof Error ? e.message : String(e)}\nrequests: ${seen.map((s) => s.path).join(" ")}`);

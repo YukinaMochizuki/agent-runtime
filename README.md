@@ -43,8 +43,24 @@ record start ─▶ run the handler (inside the host's per-call context) ─▶ 
 ```
 
 `append` is how a running turn hears about something that arrived while it worked: the host returns
-text (e.g. its inbox), and it reaches the model as a separate block after the tool's own result, at the
-next tool call rather than after the turn ends. Recording is best-effort and never breaks the call.
+text (e.g. its inbox) or content blocks (text and images, in order), and they reach the model after the
+tool's own result, at the next tool call rather than after the turn ends. Recording is best-effort and
+never breaks the call.
+
+### Images in a turn
+
+A turn's `prompt` is a string or a list of parts, `{ type: "text", text }` and
+`{ type: "image", data, mimeType }` (base64): the same shapes a tool returns (`ToolContent`). A string
+works exactly as before. Where an image can reach the model:
+
+| From | Claude | OpenAI-compatible (`vision: true`) |
+|---|---|---|
+| the prompt | content blocks of the opening user message, on `run` and on a resume | content parts of the opening user message |
+| a tool's result, or `append` | image blocks inside the `tool_result`, after the tool's text | named in the tool message's text, sent in a user message right after the tool results |
+
+On Claude a resume keeps earlier images in the session's history (Claude Code stores them). On an
+OpenAI-compatible model without `vision`, each image is replaced by a short note saying it was not sent,
+and compaction turns older images into notes like any other image.
 
 ### The Claude driver (`agent-runtime/claude`)
 
@@ -109,7 +125,8 @@ bun scripts/verify-claude-fake.ts   # the Claude driver through the real CLI, ag
 ```
 
 The unit tests drive the OpenAI-compatible driver against both a mock model and a fake HTTP endpoint;
-the script is the Claude driver's equivalent, a real Claude Code subprocess with no login or quota.
+the script is the Claude driver's equivalent, a real Claude Code subprocess with no login or quota (it
+also checks that images reach the API from a prompt, an append, and a resume).
 
 A change here is a change to every host. Before pinning a new commit in a host, run that host's own
 typecheck and tests against it (in workstream: point `agent-runtime` at a local checkout with

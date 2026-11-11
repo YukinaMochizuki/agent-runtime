@@ -23,6 +23,27 @@ import type { ZodRawShape } from "zod";
  */
 export type ToolContent = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
 
+/**
+ * One part of a turn's prompt: the same two shapes a tool may return, so a host that shows the model a
+ * picture builds it the same way whether it is the prompt, a tool's result, or a block the tool boundary
+ * appends. `image.data` is base64.
+ */
+export type PromptPart = ToolContent;
+
+/** A turn's prompt: plain text, or text and images in order. */
+export type Prompt = string | PromptPart[];
+
+/** A prompt as parts (a string becomes one text part; an empty string none). */
+export function promptParts(prompt: Prompt): PromptPart[] {
+  if (typeof prompt !== "string") return prompt;
+  return prompt ? [{ type: "text", text: prompt }] : [];
+}
+
+/** The TEXT of a prompt, images dropped (see `textOf`): for a log line or a transcript. */
+export function promptText(prompt: Prompt): string {
+  return typeof prompt === "string" ? prompt : textOf({ content: prompt });
+}
+
 /** A tool's result. A host may add fields of its own (never sent to the model) by extending it. */
 export interface ToolResult {
   content: ToolContent[];
