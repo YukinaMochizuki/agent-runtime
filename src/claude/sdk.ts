@@ -1,6 +1,7 @@
-import { query, type Options } from "@anthropic-ai/claude-agent-sdk";
+import { query, type Options, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { EFFORT_LEVELS, type EffortLevel } from "../effort.ts";
 import type { ModelChoice, TurnUsage } from "../adapter.ts";
+import type { Prompt, PromptPart } from "../tool.ts";
 import { ClaudeStreamTranslator } from "./stream.ts";
 
 /**
@@ -109,7 +110,8 @@ export interface RateLimitReading {
 export interface RunClaudeAgentInput {
   /** The login to run on (absent: the process's own environment). */
   configDir?: string | null;
-  prompt: string;
+  /** Text, or text and images (sent as one user message of content blocks; see `claudePrompt`). */
+  prompt: Prompt;
   systemPrompt?: string;
   /** Absent: the SDK's own default. A host with a configured default passes it here. */
   model?: string;
@@ -175,6 +177,38 @@ export function claudeQueryOptions(input: RunClaudeAgentInput): Options {
   return options;
 }
 
+/** Prompt parts as Messages API content blocks: an image as a base64 source. */
+export function claudeContentBlocks(parts: PromptPart[]): Array<Record<string, unknown>> {
+  return parts.map((p) =>
+    p.type === "text" ? { type: "text", text: p.text } : { type: "image", source: { type: "base64", media_type: p.mimeType, data: p.data } },
+  );
+}
+
+/**
+ * The prompt as `query` takes it. A string goes as it always has. Parts go as ONE user message of content
+ * blocks, through the SDK's streaming input (an iterable of user messages): a string prompt cannot carry an
+ * image. The iterable ends after that message, so the turn is still a single user turn: the SDK closes the
+ * CLI's input once the first result arrives (it waits for it because in-process MCP tools need the channel).
+ * The same holds on a resume: the message is the next user message of the resumed session.
+ */
+export function claudePrompt(prompt: Prompt): string | AsyncIterable<SDKUserMessage> {
+  if (typeof prompt === "string") return prompt;
+  const message = {
+    type: "user",
+    message: { role: "user", content: claudeContentBlocks(prompt) },
+    parent_tool_use_id: null,
+  } as unknown as SDKUserMessage; // the block shapes are the Messages API's; the SDK types them from its own copy
+  return (async function* () {
+    yield message;
+  })();
+}
+
+/** Why a non-success `result` ended the run: its subtype, then the CLI's own errors when it gave some. */
+export function resultErrorMessage(result: { subtype: string; errors?: unknown }): string {
+  const errors = Array.isArray(result.errors) ? result.errors.filter((e): e is string => typeof e === "string" && e.length > 0) : [];
+  return `Claude Agent SDK run ended with "${result.subtype}"${errors.length ? `: ${errors.join("; ")}` : ""}`;
+}
+
 export async function runClaudeAgent(input: RunClaudeAgentInput): Promise<RunClaudeAgentResult> {
   const options = claudeQueryOptions(input);
 
@@ -199,7 +233,7 @@ export async function runClaudeAgent(input: RunClaudeAgentInput): Promise<RunCla
   // assistant message — see stream.ts.
   const translator = new ClaudeStreamTranslator({ onToken: input.onToken, onTool: input.onTool, onToolDraft: input.onToolDraft });
 
-  for await (const message of query({ prompt: input.prompt, options })) {
+  for await (const message of query({ prompt: claudePrompt(input.prompt), options })) {
     // Every message carries session_id: surface it from the FIRST one, not at `result`. A run killed
     // mid-flight (a restart) must still be resumable.
     const mid = (message as { session_id?: string }).session_id;
@@ -247,7 +281,7 @@ export async function runClaudeAgent(input: RunClaudeAgentInput): Promise<RunCla
       if (message.subtype === "success") {
         text = message.result;
       } else {
-        throw new Error(`Claude Agent SDK run ended with "${message.subtype}"`);
+        throw new Error(resultErrorMessage(message));
       }
     }
   }

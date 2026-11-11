@@ -119,6 +119,20 @@ describe("OpenAICompatBackend over HTTP", () => {
     expect(parts.some((p) => p.type === "image_url" && p.image_url!.url.startsWith("data:image/png;base64,iVBORw0KGgo="))).toBe(true);
   });
 
+  test("an image in the prompt reaches a model that sees as image_url in the opening user message, after its text", async () => {
+    requests.length = 0;
+    const provider = { name: "fake", baseURL: `http://localhost:${server.port}/v1`, apiKey: "sk-fake" };
+    await new OpenAICompatBackend({ provider, store: memoryStore(), defaultModel: "fake-1", vision: true }).run(
+      { prompt: [{ type: "text", text: "what is this?" }, { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }], tools: [] },
+      {},
+    );
+    const user = requests[0]!.messages.find((m) => m.role === "user")!;
+    const parts = user.content as Array<{ type: string; text?: string; image_url?: { url: string } }>;
+    expect(parts[0]).toEqual({ type: "text", text: "what is this?" });
+    expect(parts[1]!.type).toBe("image_url");
+    expect(parts[1]!.image_url!.url).toStartWith("data:image/png;base64,iVBORw0KGgo=");
+  });
+
   test("with cache breakpoints on, the system prompt and the last message carry cache_control on the wire; off, nothing does", async () => {
     const provider = { name: "fake", baseURL: `http://localhost:${server.port}/v1`, apiKey: "sk-fake" };
     requests.length = 0;

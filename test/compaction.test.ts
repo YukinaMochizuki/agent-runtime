@@ -58,6 +58,19 @@ describe("where history may be cut", () => {
     expect(JSON.stringify(next)).not.toContain("old request");
   });
 
+  test("a prompt carrying a photo opens a turn (whichever part comes first); as the kept opening, its image is pruned and its text kept", async () => {
+    const photo: ModelMessage = { role: "user", content: [{ type: "text", text: "THE PHOTO REQUEST" }, { type: "file", data: "BBBB".repeat(5000), mediaType: "image/jpeg" }] };
+    const imageFirst: ModelMessage = { role: "user", content: [{ type: "file", data: "CCCC", mediaType: "image/jpeg" }, { type: "text", text: "caption" }] };
+    expect(turnStarts([user("a"), said("ok"), photo, call("1"), result("1", "x"), images, said("ok"), imageFirst])).toEqual([0, 2, 7]);
+    expect(estimateTokens([photo])).toBeLessThan(2_000); // an image at its flat rate, not its base64 length
+    const h: ModelMessage[] = [user("u".repeat(40_000)), said("ok"), photo, ...[1, 2, 3, 4].flatMap((i) => [call(`c${i}`), result(`c${i}`, "r")])];
+    expect(splitRecent(h, 3).opening).toEqual(photo);
+    const next = await defaultCompactor({ messages: h, usedTokens: estimateTokens(h), contextWindow: estimateTokens(h), target: 0.1, keepRecentSteps: 3, summarize: async () => "summary" });
+    expect(JSON.stringify(next![1])).toContain("THE PHOTO REQUEST");
+    expect(JSON.stringify(next![1])).toContain("an earlier image, omitted");
+    expect(JSON.stringify(next)).not.toContain("BBBB");
+  });
+
   test("Chinese text is not undercounted fourfold", () => {
     expect(estimateTokens([user("中".repeat(1000))])).toBeGreaterThanOrEqual(900);
     expect(estimateTokens([user("a".repeat(1000))])).toBeLessThanOrEqual(260);

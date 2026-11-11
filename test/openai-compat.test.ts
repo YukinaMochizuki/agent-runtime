@@ -231,6 +231,52 @@ describe("OpenAICompatBackend", () => {
     expect(JSON.stringify(blind)).not.toContain("iVBORw0KGgo=");
   });
 
+  test("a prompt of parts opens the turn as one user message, images as file parts; a model that does not see gets a note", async () => {
+    const prompt = [
+      { type: "text" as const, text: "[photo] look" },
+      { type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/jpeg" },
+    ];
+    const run = async (vision: boolean) => {
+      const store = memoryStore();
+      const model = scripted(says("a fox"));
+      await new OpenAICompatBackend({ provider: { name: "local", baseURL: "http://x" }, store, defaultModel: "m1", vision, newId: () => "conv-1", model: () => model }).run({ prompt, tools: [] }, {});
+      return { stored: store.all.get("conv-1")!, sent: JSON.stringify(model.doStreamCalls[0]!.prompt) };
+    };
+    const seeing = await run(true);
+    expect(seeing.stored[0]).toEqual({
+      role: "user",
+      content: [
+        { type: "text", text: "[photo] look" },
+        { type: "file", data: "iVBORw0KGgo=", mediaType: "image/jpeg" },
+      ],
+    });
+    expect(seeing.sent).toContain("iVBORw0KGgo=");
+    const blind = await run(false);
+    expect(JSON.stringify(blind.stored)).not.toContain("iVBORw0KGgo=");
+    expect(blind.sent).toContain("does not take images");
+    expect(blind.sent).toContain("[photo] look");
+  });
+
+  test("a string prompt is stored as a string, as before", async () => {
+    const store = memoryStore();
+    await backend(scripted(says("ok")), store).run({ prompt: "hi", tools: [] }, {});
+    expect(store.all.get("conv-1")![0]).toEqual({ role: "user", content: "hi" });
+  });
+
+  test("blocks the boundary appends (text and an image) follow the tool's own result: text in it, the image in the user message after", async () => {
+    const store = memoryStore();
+    const boundary: ToolBoundary = { append: () => [{ type: "text", text: "[inbox] a photo arrived" }, { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" }] };
+    const model = scripted(calls("ws__echo", { text: "hi" }), says("seen"));
+    await new OpenAICompatBackend({ provider: { name: "local", baseURL: "http://x" }, store, defaultModel: "m1", vision: true, boundary, newId: () => "conv-1", model: () => model }).run({ prompt: "go", tools: [echo] }, {});
+    const h = store.all.get("conv-1")!;
+    expect(h.map((m) => m.role)).toEqual(["user", "assistant", "tool", "user", "assistant"]);
+    const result = JSON.stringify(h[2]);
+    expect(result.indexOf("echo: hi")).toBeLessThan(result.indexOf("[inbox] a photo arrived"));
+    expect(result).not.toContain("iVBORw0KGgo=");
+    expect(JSON.stringify(h[3])).toContain("iVBORw0KGgo=");
+    expect(JSON.stringify(model.doStreamCalls[1]!.prompt)).toContain("iVBORw0KGgo=");
+  });
+
   test("effort is sent only at a level the endpoint has a name for", async () => {
     const high = scripted(says("a"));
     await backend(high).run({ prompt: "x", tools: [], effort: "high" }, {});

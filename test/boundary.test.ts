@@ -65,6 +65,19 @@ describe("runAtBoundary", () => {
     expect(recorded!.content).toEqual([{ type: "text", text: "out" }]);
   });
 
+  test("appended content blocks (text and images) follow the result in order; an empty list or string appends nothing", async () => {
+    const blocks = [
+      { type: "text" as const, text: "[inbox] a photo" },
+      { type: "image" as const, data: "iVBORw0KGgo=", mimeType: "image/png" },
+    ];
+    const res = await runAtBoundary(logging({ append: () => blocks }).b, call, async () => ok("out"));
+    expect(res.content).toEqual([{ type: "text", text: "out" }, ...blocks]);
+    for (const none of [[], ""]) {
+      const r = await runAtBoundary(logging({ append: () => none }).b, call, async () => ok("out"));
+      expect(r.content).toEqual([{ type: "text", text: "out" }]);
+    }
+  });
+
   test("a throwing handler is recorded and re-thrown; nothing is appended", async () => {
     const { log, b } = logging();
     await expect(

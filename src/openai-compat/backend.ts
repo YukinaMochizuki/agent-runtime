@@ -1,10 +1,10 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
-import { generateText, isStepCount, streamText, tool, type LanguageModel, type ModelMessage, type ToolResultPart, type ToolSet } from "ai";
+import { generateText, isStepCount, streamText, tool, type LanguageModel, type ModelMessage, type ToolResultPart, type ToolSet, type UserModelMessage } from "ai";
 import { z } from "zod";
 import type { AdapterContinueInput, AdapterRunInput, AdapterRunOptions, AdapterRunResult, BackendAdapter, TurnUsage } from "../adapter.ts";
 import { runAtBoundary, type ToolBoundary } from "../boundary.ts";
 import type { EffortLevel } from "../effort.ts";
-import type { ToolBundle, ToolDef, ToolResult } from "../tool.ts";
+import type { Prompt, ToolBundle, ToolDef, ToolResult } from "../tool.ts";
 import { withCacheBreakpoints } from "./cache.ts";
 import { defaultCompactor, estimateTokens, SUMMARY_INSTRUCTIONS, TOOL_IMAGES_PREFIX, type CompactionOptions } from "./compaction.ts";
 
@@ -113,8 +113,9 @@ export interface OpenAICompatBackendOptions {
   /** A fresh conversation id (default: a UUID). */
   newId?: () => string;
   /**
-   * Whether the model takes images. When it does, an image a tool returns is sent in a user message after
-   * the tool results; when it does not (or it is not known), it is dropped with a note in the result.
+   * Whether the model takes images. When it does, an image in a turn's prompt is sent as an image part of
+   * that user message, and an image a tool returns (or the boundary appends) is sent in a user message after
+   * the tool results; when it does not (or it is not known), each is dropped with a note in its place.
    */
   vision?: boolean;
   /**
@@ -169,6 +170,25 @@ export function toToolOutput(res: ToolResult, vision = false): { output: ToolRes
   });
   const value = lines.join("\n");
   return { output: res.isError ? { type: "error-text", value } : { type: "text", value }, images };
+}
+
+/**
+ * The user message that opens a turn. A string stays a string (the wire format, and the stored history, of
+ * every text-only turn are unchanged). Parts become content parts in order, an image as a `file` part (the
+ * same shape the tool-images message uses, which compaction prunes); without `vision`, a note instead.
+ */
+export function toUserMessage(prompt: Prompt, vision = false): UserModelMessage {
+  if (typeof prompt === "string") return { role: "user", content: prompt };
+  return {
+    role: "user",
+    content: prompt.map((p) =>
+      p.type === "text"
+        ? { type: "text" as const, text: p.text }
+        : vision
+          ? { type: "file" as const, data: p.data, mediaType: p.mimeType }
+          : { type: "text" as const, text: `[an image (${p.mimeType}) was attached; this model does not take images, so it was not sent]` },
+    ),
+  };
 }
 
 const errorResult = (call: { toolCallId: string; toolName: string }, text: string): ToolResultPart => ({
@@ -247,7 +267,7 @@ export class OpenAICompatBackend implements BackendAdapter {
       messages.push(...msgs);
       await this.opts.store.append(id, msgs);
     };
-    await keep([{ role: "user", content: input.prompt }]);
+    await keep([toUserMessage(input.prompt, this.opts.vision)]);
 
     let usage: TurnUsage = { model: modelId, costUsd: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheCreationTokens: 0 };
     let text = "";

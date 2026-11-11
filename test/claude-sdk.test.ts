@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { claudeQueryOptions, claudeSubprocessEnv } from "../src/claude/sdk.ts";
+import { claudePrompt, claudeQueryOptions, claudeSubprocessEnv, resultErrorMessage } from "../src/claude/sdk.ts";
 
 /** The query options ARE the behaviour: each flag here is a lesson a host would otherwise relearn. */
 describe("claudeQueryOptions", () => {
@@ -27,6 +27,46 @@ describe("claudeQueryOptions", () => {
     expect(o.model).toBeUndefined();
     expect(o.resume).toBe("s1");
   });
+});
+
+describe("claudePrompt", () => {
+  test("a string goes as the string", () => {
+    expect(claudePrompt("hi")).toBe("hi");
+  });
+
+  test("parts go as ONE user message of content blocks, an image as a base64 source, in order", async () => {
+    const p = claudePrompt([
+      { type: "text", text: "look" },
+      { type: "image", data: "iVBORw0KGgo=", mimeType: "image/png" },
+      { type: "text", text: "what is it?" },
+    ]);
+    expect(typeof p).not.toBe("string");
+    const msgs = [];
+    for await (const m of p as AsyncIterable<unknown>) msgs.push(m);
+    expect(msgs).toEqual([
+      {
+        type: "user",
+        parent_tool_use_id: null,
+        message: {
+          role: "user",
+          content: [
+            { type: "text", text: "look" },
+            { type: "image", source: { type: "base64", media_type: "image/png", data: "iVBORw0KGgo=" } },
+            { type: "text", text: "what is it?" },
+          ],
+        },
+      },
+    ]);
+  });
+});
+
+test("a failed result's message carries the CLI's errors when it gave some, and is unchanged when it did not", () => {
+  expect(resultErrorMessage({ subtype: "error_during_execution", errors: ["No conversation found with session ID: s1"] })).toBe(
+    'Claude Agent SDK run ended with "error_during_execution": No conversation found with session ID: s1',
+  );
+  expect(resultErrorMessage({ subtype: "error_during_execution", errors: ["a", "b"] })).toBe('Claude Agent SDK run ended with "error_during_execution": a; b');
+  expect(resultErrorMessage({ subtype: "error_max_turns", errors: [] })).toBe('Claude Agent SDK run ended with "error_max_turns"');
+  expect(resultErrorMessage({ subtype: "error_max_turns" })).toBe('Claude Agent SDK run ended with "error_max_turns"');
 });
 
 // The SDK's `env` replaces the CLI child's environment wholesale, so the switch that keeps the claude.ai
