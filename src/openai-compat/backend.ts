@@ -479,17 +479,3 @@ export class OpenAICompatBackend implements BackendAdapter {
     return { tools, defs };
   }
 }
-
-/**
- * The models an endpoint lists (`GET <baseURL>/models`, the OpenAI shape `{data: [{id}]}`), as picker rows
- * whose ids are `<provider>/<model>`. A provider that does not answer lists nothing; the caller decides
- * whether that is an error.
- */
-export async function listOpenAICompatModels(provider: OpenAICompatProvider, fetchImpl: typeof fetch = fetch): Promise<Array<{ id: string; label: string; provider: string }>> {
-  const res = await fetchImpl(`${provider.baseURL.replace(/\/$/, "")}/models`, {
-    headers: { ...(provider.apiKey ? { authorization: `Bearer ${provider.apiKey}` } : {}), ...(provider.headers ?? {}) },
-  });
-  if (!res.ok) throw new Error(`${provider.name}: GET /models answered ${res.status}`);
-  const body = (await res.json()) as { data?: Array<{ id?: unknown }> };
-  return (body.data ?? []).flatMap((m) => (typeof m.id === "string" ? [{ id: `${provider.name}/${m.id}`, label: m.id, provider: provider.name }] : []));
-}
