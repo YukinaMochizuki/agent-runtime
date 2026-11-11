@@ -1,7 +1,8 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import type { ModelMessage } from "ai";
 import { z } from "zod";
-import { listOpenAICompatModels, OpenAICompatBackend, type ConversationStore } from "../src/openai-compat/backend.ts";
+import { OpenAICompatBackend, type ConversationStore } from "../src/openai-compat/backend.ts";
+import { listOpenAICompatModels } from "../src/openai-compat/probe.ts";
 import { ok, type ToolBundle } from "../src/tool.ts";
 
 /**
@@ -138,8 +139,8 @@ describe("OpenAICompatBackend over HTTP", () => {
   test("the models an endpoint lists, with its key sent", async () => {
     const provider = { name: "fake", baseURL: `http://localhost:${server.port}/v1`, apiKey: "sk-fake" };
     expect(await listOpenAICompatModels(provider)).toEqual([
-      { id: "fake/fake-1", label: "fake-1", provider: "fake" },
-      { id: "fake/fake-2", label: "fake-2", provider: "fake" },
+      { id: "fake/fake-1", label: "fake-1", provider: "fake", model: "fake-1", reported: {} },
+      { id: "fake/fake-2", label: "fake-2", provider: "fake", model: "fake-2", reported: {} },
     ]);
     await expect(listOpenAICompatModels({ ...provider, apiKey: "wrong" })).rejects.toThrow(/401/);
   });

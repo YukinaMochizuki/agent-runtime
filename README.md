@@ -70,6 +70,15 @@ models through OpenRouter, ...), `cacheBreakpoints` marks `cache_control` on the
 and the latest message (a rolling marker: it moves to the newest message on every request, as Claude Code's
 does, so each request reads the one before it from cache).
 
+**What a model can do** (`probe.ts`). `listOpenAICompatModels` returns, per model, what `GET /models`
+reported (context window, input modalities, tools, reasoning), leaving whatever an endpoint does not say
+undefined rather than false. `probeModel` sends one small streamed request offering a single `ping` tool
+and reports whether a structured tool call came back (`ok`), the model answered in text instead
+(`text-instead`: a served model whose tool-call parser is off), or the request failed (an error kind a
+human acts on: auth, not-found, tools-unsupported, timeout, unreachable, ...), with its latency. Optionally
+it also sends a small picture and reports only whether the endpoint accepted it. It never retries and
+waits minutes by default, for endpoints that scale to zero.
+
 ## Using it
 
 It is consumed as TypeScript source (both hosts run Bun); there is no build step. Pin a commit:
