@@ -34,15 +34,36 @@
  * progress update that never streamed is never dropped. Tool calls are not matched this way: the retry's tool_use ids
  * differ from the stream's, and a second `onTool` only re-flushes an empty prose segment.
  *
+ * COMPACTION: Claude Code compacts a long conversation itself (automatically past its threshold, or on
+ * `/compact`) and says so with a `system` message, subtype `compact_boundary`, carrying the trigger and the
+ * tokens before (and, in newer versions, after). It is forwarded as `onCompaction` in the runtime's shared
+ * shape (adapter.ts `CompactionEvent`), at its place in the stream, so a transcript can mark the point after
+ * which the model sees only a summary.
+ *
  * Not every unstreamed `assistant` message is a model response. Claude Code makes some up itself
  * ("API Error: Connection lost mid-response…"), marked `model: "<synthetic>"` and
  * `is_api_error_message`. Those are the CLI talking, not the agent, so they are never replayed as prose.
  */
 
+import type { CompactionEvent } from "../adapter.ts";
+
 export interface StreamCallbacks {
   onToken?: (text: string, thinking?: boolean) => void;
   onTool?: (name: string, input?: unknown) => void;
   onToolDraft?: (name: string) => void;
+  onCompaction?: (event: CompactionEvent) => void;
+}
+
+/** The compaction a `system` / `compact_boundary` message reports, or null for any other message. */
+export function compactionOf(message: { type: string; subtype?: unknown; compact_metadata?: unknown }): CompactionEvent | null {
+  if (message.type !== "system" || message.subtype !== "compact_boundary") return null;
+  // A beta surface: guard each field rather than trust the type.
+  const m = (message.compact_metadata ?? {}) as { trigger?: unknown; pre_tokens?: unknown; post_tokens?: unknown };
+  return {
+    trigger: m.trigger === "manual" ? "manual" : "auto",
+    tokensBefore: typeof m.pre_tokens === "number" ? m.pre_tokens : 0,
+    ...(typeof m.post_tokens === "number" ? { tokensAfter: m.post_tokens } : {}),
+  };
 }
 
 type ContentBlock = { type?: string; text?: string; thinking?: string; id?: string; name?: string; input?: unknown };
@@ -82,10 +103,14 @@ export class ClaudeStreamTranslator {
 
   constructor(private readonly cb: StreamCallbacks) {}
 
-  /** Feed one SDK message. Only `stream_event` and `assistant` matter; anything else is ignored. */
-  handle(message: { type: string; event?: unknown; message?: unknown; is_api_error_message?: unknown }): void {
+  /** Feed one SDK message. `stream_event`, `assistant` and a compaction boundary matter; anything else is ignored. */
+  handle(message: { type: string; event?: unknown; message?: unknown; is_api_error_message?: unknown; subtype?: unknown; compact_metadata?: unknown }): void {
     if (message.type === "stream_event") this.streamEvent(message.event);
     else if (message.type === "assistant" && message.is_api_error_message !== true) this.assistant(message.message);
+    else if (message.type === "system") {
+      const c = compactionOf(message);
+      if (c) this.cb.onCompaction?.(c);
+    }
   }
 
   private streamEvent(raw: unknown): void {

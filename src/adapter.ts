@@ -32,6 +32,24 @@ export interface AdapterRunOptions {
   onSessionId?: (backendSessionId: string) => void;
   /** Abort the in-flight turn (a user stop). Every driver must honour it. */
   signal?: AbortSignal;
+  /**
+   * The driver compacted the conversation during this turn: from here on the model sees a summary of what
+   * came before, not the messages themselves. Every driver that compacts reports it here, in one shape, so a
+   * host can mark the point in a transcript. Fired once per compaction, at the point in the turn it happened.
+   */
+  onCompaction?: (event: CompactionEvent) => void;
+}
+
+/** A compaction, as a driver reports it to the host (`AdapterRunOptions.onCompaction`). */
+export interface CompactionEvent {
+  /** `auto`: the driver's own threshold; `manual`: someone asked for it (Claude Code's `/compact`). */
+  trigger: "auto" | "manual";
+  /** The context before it, in tokens, as the driver measured it. */
+  tokensBefore: number;
+  /** The context after it, when the driver reports that. */
+  tokensAfter?: number;
+  /** Whether the older part was summarized by the model (true) or only pruned (false); absent when unknown. */
+  summarized?: boolean;
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any

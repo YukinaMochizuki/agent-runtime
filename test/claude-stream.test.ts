@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { ClaudeStreamTranslator } from "../src/claude/stream.ts";
+import type { CompactionEvent } from "../src/adapter.ts";
+import { ClaudeStreamTranslator, compactionOf } from "../src/claude/stream.ts";
 
 /**
  * The shapes below are what the Agent SDK actually emits (observed against a mock endpoint): a streamed
@@ -217,6 +218,45 @@ describe("ClaudeStreamTranslator", () => {
       ["token", "Fallback."],
       ["token", "\n\n"],
       ["token", "Streamed."],
+    ]);
+  });
+});
+
+describe("compaction", () => {
+  const boundary = (meta: unknown) => ({ type: "system", subtype: "compact_boundary", compact_metadata: meta });
+
+  test("a compact_boundary in the stream is forwarded at its place, between the prose before and after it", () => {
+    const out: string[] = [];
+    const events: CompactionEvent[] = [];
+    const t = new ClaudeStreamTranslator({
+      onToken: (s) => out.push(`text:${s}`),
+      onTool: (n) => out.push(`tool:${n}`),
+      onCompaction: (e) => (events.push(e), out.push(`compaction:${e.trigger}:${e.tokensBefore}`)),
+    });
+    const script = [
+      ...streamed("m1", "Before the summary.", { id: "tu1", name: "look", input: {} }),
+      boundary({ trigger: "auto", pre_tokens: 167_000, post_tokens: 12_000 }),
+      { type: "system", subtype: "init" }, // other system messages are not compactions
+      ...streamed("m2", "After it."),
+    ];
+    for (const m of script) t.handle(m as never);
+    expect(out).toEqual(["text:Before the summary.", "tool:look", "compaction:auto:167000", "text:After it."]);
+    expect(events).toEqual([{ trigger: "auto", tokensBefore: 167_000, tokensAfter: 12_000 }]);
+  });
+
+  test("its fields are guarded: a manual one, one without post_tokens, and a malformed one", () => {
+    expect(compactionOf(boundary({ trigger: "manual", pre_tokens: 90_000 }))).toEqual({ trigger: "manual", tokensBefore: 90_000 });
+    expect(compactionOf(boundary(undefined))).toEqual({ trigger: "auto", tokensBefore: 0 });
+    expect(compactionOf(boundary({ trigger: "weird", pre_tokens: "lots" }))).toEqual({ trigger: "auto", tokensBefore: 0 });
+    expect(compactionOf({ type: "system", subtype: "init" })).toBeNull();
+    expect(compactionOf({ type: "assistant" })).toBeNull();
+  });
+
+  test("a host that does not listen is unaffected (backward compatible)", () => {
+    expect(run([...streamed("m1", "Hello."), boundary({ trigger: "auto", pre_tokens: 1 }), ...streamed("m2", "Again.")])).toEqual([
+      ["token", "Hello."],
+      ["token", "\n\n"],
+      ["token", "Again."],
     ]);
   });
 });

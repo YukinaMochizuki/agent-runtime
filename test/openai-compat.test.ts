@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import type { CompactionEvent } from "../src/adapter.ts";
 import type { LanguageModelV4StreamPart } from "@ai-sdk/provider";
 import type { ModelMessage } from "ai";
 import { MockLanguageModelV4, convertArrayToReadableStream } from "ai/test";
@@ -351,6 +352,14 @@ describe("compaction in the loop", () => {
     expect(reports).toHaveLength(1);
     expect(reports[0]).toMatchObject({ summarized: false }); // pruning old outputs was enough
     const kept = store.all.get("conv-1")!;
+    // The host-facing report (the run option), in the shape every driver shares.
+    const events: CompactionEvent[] = [];
+    const again = memoryStore();
+    await compacting(again, measuring(...steps(8, "first done")), 10_000).run({ prompt: "read it all", tools: [bigTool] }, { onCompaction: (e) => events.push(e) });
+    expect(events).toHaveLength(1);
+    expect(events[0]).toMatchObject({ trigger: "auto", summarized: false });
+    expect(events[0]!.tokensBefore).toBeGreaterThan(7_500);
+    expect(events[0]!.tokensAfter!).toBeLessThan(events[0]!.tokensBefore);
     expect(unansweredCalls(kept)).toEqual([]);
     expect(JSON.stringify(kept)).toContain("omitted to save context");
     // The next turn loads the compacted history: no compaction again just for starting.
@@ -490,15 +499,17 @@ describe("compaction in the loop", () => {
 
   test("a host compactor's result that an endpoint would refuse is not stored, and the turn goes on", async () => {
     const store = memoryStore();
+    let hostEvents = 0;
     const reports: Array<{ rejected?: string }> = [];
     const orphan: ModelMessage[] = [{ role: "tool", content: [{ type: "tool-result", toolCallId: "ghost", toolName: "t", output: { type: "text", value: "x" } }] }];
     const r = await compacting(store, measuring(...steps(8, "done")), 10_000, {
       compaction: { contextWindow: 10_000, keepRecentSteps: 2, compactor: async () => orphan },
       onCompaction: (rep: { rejected?: string }) => reports.push(rep),
-    }).run({ prompt: "read", tools: [bigTool] }, {});
+    }).run({ prompt: "read", tools: [bigTool] }, { onCompaction: () => hostEvents++ });
     expect(r.text).toBe("done");
     expect(store.compactions).toBe(0);
     expect(reports[0]?.rejected).toMatch(/no earlier message calls/);
+    expect(hostEvents).toBe(0); // nothing was compacted, so the host is told nothing
   });
 
   test("across turns, and after a reload from the store, each request's prefix is the last one's, unchanged", async () => {

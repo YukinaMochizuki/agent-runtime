@@ -72,6 +72,7 @@ export class ClaudeBackend implements BackendAdapter {
       onTool: opts.onTool,
       onToolDraft: opts.onToolDraft,
       onSessionId: opts.onSessionId,
+      ...(opts.onCompaction ? { onCompaction: opts.onCompaction } : {}),
       onRateLimit: this.opts.onRateLimit,
       signal: opts.signal,
     });

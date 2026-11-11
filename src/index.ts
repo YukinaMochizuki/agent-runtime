@@ -4,6 +4,7 @@ export type {
   AdapterRunOptions,
   AdapterRunResult,
   BackendAdapter,
+  CompactionEvent,
   ModelChoice,
   TurnUsage,
 } from "./adapter.ts";
