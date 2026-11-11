@@ -19,7 +19,15 @@ agent-runtime            the contract and the tool layer
 agent-runtime/claude     the Claude Agent SDK driver
 agent-runtime/openai-compat
                          any OpenAI-compatible endpoint, on an agent loop written here
+agent-runtime/tools/web  web_search / web_scrape / web_fetch, configured by the host
 ```
+
+### Shared tools (`agent-runtime/tools/*`)
+
+Most tools belong to a host, because they act on its own concepts (workstream's boxes, a chat's
+messages). A tool lives here instead when it needs no host store or state and more than one host wants
+it: today that is outbound web access. Such a module reads no environment; the host passes in its
+configuration (API keys, endpoints) and decides which runs get the tools.
 
 ### The tool boundary
 
