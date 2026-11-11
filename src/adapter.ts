@@ -51,6 +51,12 @@ export interface AdapterRunInput<B extends ToolBundle<any> = ToolBundle> {
 export interface AdapterContinueInput<B extends ToolBundle<any> = ToolBundle> extends AdapterRunInput<B> {
   /** The conversation id returned by a previous run/continue. */
   backendSessionId: string;
+  /**
+   * The context the previous turn ENDED at, in tokens, if the host recorded it (its last usage: input,
+   * cached included, plus output). A driver that manages its own context starts the turn from this
+   * measurement rather than from an estimate; one that does not ignores it.
+   */
+  contextTokens?: number;
 }
 
 /** One turn's usage. `inputTokens`/`cache*` describe the FINAL request (= context occupancy). */

@@ -57,6 +57,19 @@ appended as it is produced so a crash loses at most the step in flight. The syst
 turn, never stored. Reasoning effort is sent as `reasoning_effort` only at the levels an endpoint has a
 name for (low / medium / high).
 
+**Context and the prompt cache.** A provider caches a request's prefix, so the loop only ever appends to
+history: the messages of every request start with those of the previous one, unchanged, across turns and
+reloads too. Compaction (`compaction` option, with a host store that implements `compact`) waits until the
+context crosses a threshold (measured by the endpoint where it reports usage, carried across turns through
+`contextTokens`), then compacts once: older tool outputs and images become short notes; if that is not
+enough, the older part becomes one summary written by the model (the request being worked on is kept word
+for word); if even that is not enough, the tool output of every step but the latest is shortened. It cuts
+only before a step, so a tool call is never separated from its result, and a summary that fails falls back
+to pruning instead of failing the turn. For providers that cache only up to a marker (Anthropic and Gemini
+models through OpenRouter, ...), `cacheBreakpoints` marks `cache_control` on the system prompt, the summary
+and the latest message (a rolling marker: it moves to the newest message on every request, as Claude Code's
+does, so each request reads the one before it from cache).
+
 ## Using it
 
 It is consumed as TypeScript source (both hosts run Bun); there is no build step. Pin a commit:
