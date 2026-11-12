@@ -1,7 +1,7 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, isStepCount, streamText, tool, type LanguageModel, type ModelMessage, type ToolResultPart, type ToolSet, type UserModelMessage } from "ai";
 import { z } from "zod";
-import type { AdapterContinueInput, AdapterRunInput, AdapterRunOptions, AdapterRunResult, BackendAdapter, TurnUsage } from "../adapter.ts";
+import type { AdapterContinueInput, AdapterRunInput, AdapterRunOptions, AdapterRunResult, BackendAdapter, CompactionEvent, TurnUsage } from "../adapter.ts";
 import { runAtBoundary, type ToolBoundary } from "../boundary.ts";
 import type { EffortLevel } from "../effort.ts";
 import type { Prompt, ToolBundle, ToolDef, ToolResult } from "../tool.ts";
@@ -286,7 +286,7 @@ export class OpenAICompatBackend implements BackendAdapter {
       signal?.throwIfAborted();
       if (step >= maxSteps) throw new Error(`stopped after ${maxSteps} model calls in one turn without a final answer`);
       const used = measured ? measured.tokens + estimateTokens(messages.slice(measured.messages)) : overhead + estimateTokens(messages);
-      const attempt = await this.compactIfNeeded(id, messages, used, model, compactedAt, signal);
+      const attempt = await this.compactIfNeeded(id, messages, used, model, compactedAt, signal, opts.onCompaction);
       if (attempt) {
         // An attempt that changed nothing (nothing to cut, a summary that failed, a result refused) counts
         // too: trying again at the very next step would only pay for the same summary again.
@@ -423,7 +423,15 @@ export class OpenAICompatBackend implements BackendAdapter {
    * compactor cannot get under the threshold (a huge current step) would otherwise be compacted, and pay for
    * a summary, before every single call.
    */
-  private async compactIfNeeded(id: string, messages: ModelMessage[], used: number, model: LanguageModel, compactedAt: number, signal: AbortSignal | undefined): Promise<{ next: ModelMessage[] | null } | null> {
+  private async compactIfNeeded(
+    id: string,
+    messages: ModelMessage[],
+    used: number,
+    model: LanguageModel,
+    compactedAt: number,
+    signal: AbortSignal | undefined,
+    onCompaction?: (event: CompactionEvent) => void,
+  ): Promise<{ next: ModelMessage[] | null } | null> {
     const c = this.opts.compaction;
     if (!c || !this.opts.store.compact) return null;
     const threshold = c.threshold ?? 0.75;
@@ -474,13 +482,17 @@ export class OpenAICompatBackend implements BackendAdapter {
     }
     await this.opts.store.compact(id, next);
     const scale = used / Math.max(1, estimateTokens(messages));
+    const afterTokens = Math.round(estimateTokens(next) * scale);
     this.opts.onCompaction?.({
       beforeTokens: used,
-      afterTokens: Math.round(estimateTokens(next) * scale),
+      afterTokens,
       summarized,
       ...(summaryTokens ? { summaryTokens } : {}),
       ...(summaryError ? { summaryError } : {}),
     });
+    // The host-facing report, the same shape the Claude driver gives (adapter.ts `CompactionEvent`). Only
+    // a compaction that happened: one that failed or was refused left the conversation as it was.
+    onCompaction?.({ trigger: "auto", tokensBefore: used, tokensAfter: afterTokens, summarized });
     return { next };
   }
 

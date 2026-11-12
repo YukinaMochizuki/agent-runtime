@@ -1,6 +1,6 @@
 import { query, type Options, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { EFFORT_LEVELS, type EffortLevel } from "../effort.ts";
-import type { ModelChoice, TurnUsage } from "../adapter.ts";
+import type { CompactionEvent, ModelChoice, TurnUsage } from "../adapter.ts";
 import type { Prompt, PromptPart } from "../tool.ts";
 import { ClaudeStreamTranslator } from "./stream.ts";
 
@@ -146,6 +146,8 @@ export interface RunClaudeAgentInput {
   onSessionId?: (id: string) => void;
   /** Each `rate_limit_event`: how full a window of this login is, as of this request. */
   onRateLimit?: (reading: RateLimitReading) => void;
+  /** Claude Code compacted the conversation (a `compact_boundary` message; stream.ts `compactionOf`). */
+  onCompaction?: (event: CompactionEvent) => void;
   /** Abort the run mid-flight (user stop). */
   signal?: AbortSignal;
 }
@@ -240,7 +242,7 @@ export async function runClaudeAgent(input: RunClaudeAgentInput): Promise<RunCla
   let ctxUsage: { input: number; cacheRead: number; cacheCreation: number; output: number } | null = null;
   // Prose and tool calls, from the stream or (on Claude Code's non-streaming fallback) from the complete
   // assistant message — see stream.ts.
-  const translator = new ClaudeStreamTranslator({ onToken: input.onToken, onTool: input.onTool, onToolDraft: input.onToolDraft });
+  const translator = new ClaudeStreamTranslator({ onToken: input.onToken, onTool: input.onTool, onToolDraft: input.onToolDraft, onCompaction: input.onCompaction });
 
   for await (const message of query({ prompt: claudePrompt(input.prompt), options })) {
     // Every message carries session_id: surface it from the FIRST one, not at `result`. A run killed
@@ -250,7 +252,7 @@ export async function runClaudeAgent(input: RunClaudeAgentInput): Promise<RunCla
       sessionId = mid;
       input.onSessionId?.(sessionId);
     }
-    translator.handle(message as { type: string; event?: unknown; message?: unknown });
+    translator.handle(message as { type: string; event?: unknown; message?: unknown; subtype?: unknown; compact_metadata?: unknown });
     if (message.type === "rate_limit_event") {
       const info = (message as { rate_limit_info?: { rateLimitType?: string; utilization?: number; resetsAt?: number } }).rate_limit_info;
       const window = info?.rateLimitType === "five_hour" || info?.rateLimitType === "seven_day" ? info.rateLimitType : null;
