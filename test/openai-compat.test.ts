@@ -258,6 +258,20 @@ describe("OpenAICompatBackend", () => {
     expect(blind.sent).toContain("[photo] look");
   });
 
+  test("without vision, images already in the history (a carried conversation) are sent as notes and stay stored", async () => {
+    const store = memoryStore();
+    store.all.set("conv-1", [
+      { role: "user", content: [{ type: "text", text: "earlier" }, { type: "file", data: "iVBORw0KGgo=", mediaType: "image/png" }] },
+      { role: "assistant", content: [{ type: "text", text: "a cat" }] },
+    ]);
+    const model = scripted(says("ok"));
+    await new OpenAICompatBackend({ provider: { name: "local", baseURL: "http://x" }, store, defaultModel: "m1", vision: false, model: () => model }).continueRun({ backendSessionId: "conv-1", prompt: "and now?", tools: [] }, {});
+    const sent = JSON.stringify(model.doStreamCalls[0]!.prompt);
+    expect(sent).not.toContain("iVBORw0KGgo=");
+    expect(sent).toContain("does not take images");
+    expect(JSON.stringify(store.all.get("conv-1"))).toContain("iVBORw0KGgo=");
+  });
+
   test("a string prompt is stored as a string, as before", async () => {
     const store = memoryStore();
     await backend(scripted(says("ok")), store).run({ prompt: "hi", tools: [] }, {});

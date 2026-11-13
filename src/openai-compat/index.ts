@@ -5,6 +5,7 @@ export {
   toToolOutput,
   unansweredCalls,
   wireToolName,
+  withoutImages,
   type ConversationStore,
   type OpenAICompatBackendOptions,
   type OpenAICompatProvider,
