@@ -7,6 +7,7 @@
     ".": "./src/index.ts",
     "./claude": "./src/claude/index.ts",
     "./openai-compat": "./src/openai-compat/index.ts",
+    "./convert": "./src/convert/index.ts",
     "./tools/web": "./src/tools/web.ts"
   },
   "files": [

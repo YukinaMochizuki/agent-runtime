@@ -116,6 +116,8 @@ export interface OpenAICompatBackendOptions {
    * Whether the model takes images. When it does, an image in a turn's prompt is sent as an image part of
    * that user message, and an image a tool returns (or the boundary appends) is sent in a user message after
    * the tool results; when it does not (or it is not known), each is dropped with a note in its place.
+   * That holds for images already in the history too (a conversation carried over from a model that took
+   * them): they are kept in the store and replaced by the same note in what is sent (`withoutImages`).
    */
   vision?: boolean;
   /**
@@ -189,6 +191,28 @@ export function toUserMessage(prompt: Prompt, vision = false): UserModelMessage 
           : { type: "text" as const, text: `[an image (${p.mimeType}) was attached; this model does not take images, so it was not sent]` },
     ),
   };
+}
+
+/**
+ * `messages` as a model that takes no images is sent them: every image (or other non-text file) part of a
+ * user message replaced by a note, as a prompt's image is. The same history always becomes the same request,
+ * so the prompt cache still matches from one request to the next. What is stored keeps the files.
+ */
+export function withoutImages(messages: ModelMessage[]): ModelMessage[] {
+  return messages.map((m) => {
+    const withheld = (p: { type: string; mediaType?: string }) => p.type === "image" || (p.type === "file" && !p.mediaType?.startsWith("text/"));
+    if (m.role !== "user" || typeof m.content === "string" || !m.content.some(withheld)) return m;
+    return {
+      ...m,
+      content: m.content.map((p) =>
+        p.type === "image" || (p.type === "file" && p.mediaType.startsWith("image"))
+          ? { type: "text" as const, text: `[an image (${p.mediaType ?? "image"}) was attached; this model does not take images, so it was not sent]` }
+          : p.type === "file" && !p.mediaType.startsWith("text/")
+            ? { type: "text" as const, text: `[a file (${p.mediaType}) was attached; this model does not take files, so it was not sent]` }
+            : p,
+      ),
+    };
+  });
 }
 
 const errorResult = (call: { toolCallId: string; toolName: string }, text: string): ToolResultPart => ({
@@ -299,7 +323,7 @@ export class OpenAICompatBackend implements BackendAdapter {
       const result = streamText({
         model,
         ...(input.systemPrompt ? { instructions: input.systemPrompt } : {}),
-        messages,
+        messages: this.opts.vision ? messages : withoutImages(messages),
         tools,
         stopWhen: isStepCount(1),
         // The error also arrives as an `error` part, which fails the turn below; the SDK's default
