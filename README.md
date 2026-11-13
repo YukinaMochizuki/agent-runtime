@@ -19,6 +19,7 @@ agent-runtime            the contract and the tool layer
 agent-runtime/claude     the Claude Agent SDK driver
 agent-runtime/openai-compat
                          any OpenAI-compatible endpoint, on an agent loop written here
+agent-runtime/convert    carry a conversation between the two drivers (a Claude Code session ⇄ ModelMessage[])
 agent-runtime/tools/web  web_search / web_scrape / web_fetch, configured by the host
 ```
 
@@ -106,6 +107,21 @@ human acts on: auth, not-found, tools-unsupported, timeout, unreachable, ...), w
 it also sends a small picture and reports only whether the endpoint accepted it. It never retries and
 waits minutes by default, for endpoints that scale to zero.
 
+### Carrying a conversation between drivers (`agent-runtime/convert`)
+
+Conversation ids are not portable between drivers, but a conversation is: `claudeSessionMessages` reads a
+Claude Code session (or its part after a position) as the `ModelMessage[]` the OpenAI-compatible driver
+keeps, and `appendToClaudeSession` writes `ModelMessage[]` onto a session (a new one, or after the latest
+entry of an existing one), which the CLI then resumes. Text, images and every tool call with its result
+carry, tool names and ids mapped to each side's form; reasoning does not (it is signed by the model that
+wrote it), nor do Claude Code's own lines (image paths on the host, a local command's echo). Appending
+only what a session lacks keeps the rest of it native: the CLI still sends its own signed thinking and the
+same prompt prefix. Which conversation belongs to whom, and when to carry what, is the host's; the session
+file format this relies on is the CLI's, and `scripts/verify-convert-fake.ts` checks it against the real CLI.
+
+With `vision: false`, images already in a carried history are sent as notes too (`withoutImages`), as a new
+prompt's are; the store keeps them.
+
 ## Using it
 
 It is consumed as TypeScript source (both hosts run Bun); there is no build step. Pin a commit:
@@ -125,6 +141,7 @@ bun install
 bun run typecheck
 bun test
 bun scripts/verify-claude-fake.ts   # the Claude driver through the real CLI, against a fake API
+bun scripts/verify-convert-fake.ts  # a conversation Claude → OpenAI-compatible → Claude, real CLI, fake APIs
 ```
 
 The unit tests drive the OpenAI-compatible driver against both a mock model and a fake HTTP endpoint;
