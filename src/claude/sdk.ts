@@ -1,6 +1,6 @@
 import { query, type Options, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { EFFORT_LEVELS, type EffortLevel } from "../effort.ts";
-import { LostSessionError, type CompactionEvent, type ModelChoice, type TurnUsage } from "../adapter.ts";
+import { LostSessionError, usageOfFailedTurn, withTurnUsage, type CompactionEvent, type ModelChoice, type TurnUsage } from "../adapter.ts";
 import type { Prompt, PromptPart } from "../tool.ts";
 import { ClaudeStreamTranslator } from "./stream.ts";
 
@@ -11,6 +11,12 @@ import { ClaudeStreamTranslator } from "./stream.ts";
  * WHICH LOGIN a turn runs on is a CLAUDE_CONFIG_DIR (where `claude auth login` left its credentials):
  * `configDir` here. Absent leaves the environment as it is, which is the login of the user the process
  * runs as. Picking among several logins is a host's policy, not this module's.
+ *
+ * No settings FILE is read (`settingSources: []`), so `<configDir>/settings.json` is ignored too. A login
+ * that needs a setting to authenticate (an `apiKeyHelper` that prints a Console API key) names a settings
+ * file in `settings`: Claude Code loads it as its flag settings (`--settings`), which apply even with no
+ * setting sources. It is passed on every entry point (a turn, `listClaudeModels`, `probeClaudeAccount`),
+ * since each one starts its own Claude Code process.
  */
 
 /**
@@ -29,9 +35,9 @@ export function claudeSubprocessEnv(configDir: string | null | undefined = null)
  * throwaway query (empty prompt, never iterated → the prompt never runs), pulls the list, and aborts.
  * Cheap enough to call once and cache at the caller.
  */
-export async function listClaudeModels(configDir: string | null = null): Promise<ModelChoice[]> {
+export async function listClaudeModels(configDir: string | null = null, settings: string | null = null): Promise<ModelChoice[]> {
   const ac = new AbortController();
-  const q = query({ prompt: "", options: { tools: [], settingSources: [], permissionMode: "dontAsk", abortController: ac, env: claudeSubprocessEnv(configDir) } });
+  const q = query({ prompt: "", options: { tools: [], settingSources: [], permissionMode: "dontAsk", abortController: ac, env: claudeSubprocessEnv(configDir), ...(settings ? { settings } : {}) } });
   try {
     const models = await q.supportedModels();
     return models.map((m) => ({
@@ -74,10 +80,10 @@ export interface AccountProbe {
  * windows from Claude Code's own /usage data, which the SDK marks experimental, so a failure there leaves
  * them null rather than failing the probe.
  */
-export async function probeClaudeAccount(configDir: string | null, timeoutMs = 15_000): Promise<AccountProbe> {
+export async function probeClaudeAccount(configDir: string | null, timeoutMs = 15_000, settings: string | null = null): Promise<AccountProbe> {
   const ac = new AbortController();
   const timer = setTimeout(() => ac.abort(), timeoutMs);
-  const q = query({ prompt: "", options: { tools: [], settingSources: [], permissionMode: "dontAsk", abortController: ac, env: claudeSubprocessEnv(configDir) } });
+  const q = query({ prompt: "", options: { tools: [], settingSources: [], permissionMode: "dontAsk", abortController: ac, env: claudeSubprocessEnv(configDir), ...(settings ? { settings } : {}) } });
   try {
     const info = await q.accountInfo();
     let windows: { five_hour?: { utilization: number | null; resets_at: string | null } | null; seven_day?: { utilization: number | null; resets_at: string | null } | null } | null = null;
@@ -110,6 +116,8 @@ export interface RateLimitReading {
 export interface RunClaudeAgentInput {
   /** The login to run on (absent: the process's own environment). */
   configDir?: string | null;
+  /** A settings file Claude Code loads as its flag settings, e.g. an `apiKeyHelper` (see the header). */
+  settings?: string | null;
   /** Text, or text and images (sent as one user message of content blocks; see `claudePrompt`). */
   prompt: Prompt;
   systemPrompt?: string;
@@ -176,6 +184,7 @@ export function claudeQueryOptions(input: RunClaudeAgentInput): Options {
     // and override each model's default.
     extraArgs: { "thinking-display": "summarized" },
     env: claudeSubprocessEnv(input.configDir ?? null),
+    ...(input.settings ? { settings: input.settings } : {}),
     ...(input.onToken || input.onTool || input.onToolDraft ? { includePartialMessages: true } : {}),
     ...(input.mcpServers ? { mcpServers: input.mcpServers } : {}),
     ...(input.effort ? { effort: input.effort } : {}),
@@ -263,57 +272,68 @@ export async function runClaudeAgent(input: RunClaudeAgentInput): Promise<RunCla
   // assistant message — see stream.ts.
   const translator = new ClaudeStreamTranslator({ onToken: input.onToken, onTool: input.onTool, onToolDraft: input.onToolDraft, onCompaction: input.onCompaction });
 
-  for await (const message of query({ prompt: claudePrompt(input.prompt), options })) {
-    // Every message carries session_id: surface it from the FIRST one, not at `result`. A run killed
-    // mid-flight (a restart) must still be resumable.
-    const mid = (message as { session_id?: string }).session_id;
-    if (mid && !sessionId) {
-      sessionId = mid;
-      input.onSessionId?.(sessionId);
-    }
-    translator.handle(message as { type: string; event?: unknown; message?: unknown; subtype?: unknown; compact_metadata?: unknown });
-    if (message.type === "rate_limit_event") {
-      const info = (message as { rate_limit_info?: { rateLimitType?: string; utilization?: number; resetsAt?: number } }).rate_limit_info;
-      const window = info?.rateLimitType === "five_hour" || info?.rateLimitType === "seven_day" ? info.rateLimitType : null;
-      if (window && typeof info?.utilization === "number") {
-        input.onRateLimit?.({ window, percent: info.utilization * 100, resetsAt: typeof info.resetsAt === "number" ? info.resetsAt * 1000 : null });
+  // Whether a `result` has priced the turn. Claude Code reports an API error (credit too low, a 500) as a
+  // result with subtype "success" and is_error set, and the SDK then throws its own error for it, with
+  // nothing on it: once a result has arrived, whatever ends the run carries what the turn cost.
+  let priced = false;
+  try {
+    for await (const message of query({ prompt: claudePrompt(input.prompt), options })) {
+      // Every message carries session_id: surface it from the FIRST one, not at `result`. A run killed
+      // mid-flight (a restart) must still be resumable.
+      const mid = (message as { session_id?: string }).session_id;
+      if (mid && !sessionId) {
+        sessionId = mid;
+        input.onSessionId?.(sessionId);
       }
-    } else if (message.type === "assistant") {
-      // Each assistant message carries the usage of the API request that produced it; keep the latest so
-      // `result` can report context occupancy (final prompt size), not the turn sum.
-      const mu = (message.message as {
-        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
-      }).usage;
-      if (mu) {
-        ctxUsage = {
-          input: mu.input_tokens ?? 0,
-          output: mu.output_tokens ?? 0,
-          cacheRead: mu.cache_read_input_tokens ?? 0,
-          cacheCreation: mu.cache_creation_input_tokens ?? 0,
+      translator.handle(message as { type: string; event?: unknown; message?: unknown; subtype?: unknown; compact_metadata?: unknown });
+      if (message.type === "rate_limit_event") {
+        const info = (message as { rate_limit_info?: { rateLimitType?: string; utilization?: number; resetsAt?: number } }).rate_limit_info;
+        const window = info?.rateLimitType === "five_hour" || info?.rateLimitType === "seven_day" ? info.rateLimitType : null;
+        if (window && typeof info?.utilization === "number") {
+          input.onRateLimit?.({ window, percent: info.utilization * 100, resetsAt: typeof info.resetsAt === "number" ? info.resetsAt * 1000 : null });
+        }
+      } else if (message.type === "assistant") {
+        // Each assistant message carries the usage of the API request that produced it; keep the latest so
+        // `result` can report context occupancy (final prompt size), not the turn sum.
+        const mu = (message.message as {
+          usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
+        }).usage;
+        if (mu) {
+          ctxUsage = {
+            input: mu.input_tokens ?? 0,
+            output: mu.output_tokens ?? 0,
+            cacheRead: mu.cache_read_input_tokens ?? 0,
+            cacheCreation: mu.cache_creation_input_tokens ?? 0,
+          };
+        }
+      } else if (message.type === "result") {
+        sessionId = message.session_id;
+        // cost/usage live on the final result message; guard each field (beta surface).
+        const m = message as {
+          total_cost_usd?: number;
+          usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
         };
-      }
-    } else if (message.type === "result") {
-      sessionId = message.session_id;
-      // cost/usage live on the final result message; guard each field (beta surface).
-      const m = message as {
-        total_cost_usd?: number;
-        usage?: { input_tokens?: number; output_tokens?: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number };
-      };
-      const u = m.usage ?? {};
-      usage = {
-        model,
-        costUsd: m.total_cost_usd ?? 0,
-        inputTokens: ctxUsage?.input ?? u.input_tokens ?? 0,
-        outputTokens: ctxUsage?.output ?? u.output_tokens ?? 0,
-        cacheReadTokens: ctxUsage?.cacheRead ?? u.cache_read_input_tokens ?? 0,
-        cacheCreationTokens: ctxUsage?.cacheCreation ?? u.cache_creation_input_tokens ?? 0,
-      };
-      if (message.subtype === "success") {
-        text = message.result;
-      } else {
-        throw resultError(message, input.resumeSessionId);
+        const u = m.usage ?? {};
+        usage = {
+          model,
+          costUsd: m.total_cost_usd ?? 0,
+          inputTokens: ctxUsage?.input ?? u.input_tokens ?? 0,
+          outputTokens: ctxUsage?.output ?? u.output_tokens ?? 0,
+          cacheReadTokens: ctxUsage?.cacheRead ?? u.cache_read_input_tokens ?? 0,
+          cacheCreationTokens: ctxUsage?.cacheCreation ?? u.cache_creation_input_tokens ?? 0,
+        };
+        priced = true;
+        if (message.subtype === "success") {
+          text = message.result;
+        } else {
+          // The turn failed, but what it spent is known: the error carries it (adapter.ts usageOfFailedTurn).
+          throw withTurnUsage(resultError(message, input.resumeSessionId), usage);
+        }
       }
     }
+  } catch (e) {
+    if (priced && e instanceof Error && !usageOfFailedTurn(e)) throw withTurnUsage(e, usage);
+    throw e;
   }
 
   return { text: text.trim(), sessionId, usage };

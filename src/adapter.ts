@@ -106,6 +106,24 @@ export interface TurnUsage {
   cacheCreationTokens: number; // input written to cache
 }
 
+/**
+ * What a turn that FAILED had already cost, when the driver knows: a host that meters spend (a per-token
+ * account with a budget) would otherwise count only the turns that succeed. The Claude driver attaches it
+ * to the error a non-success `result` ends the run with (that message still carries the turn's total).
+ * The OpenAI-compatible driver attaches none: it prices nothing, so a failed turn there reads as null, as
+ * does a turn stopped before any result arrived.
+ */
+export function usageOfFailedTurn(err: unknown): TurnUsage | null {
+  const usage = (err as { turnUsage?: unknown } | null)?.turnUsage;
+  return usage && typeof usage === "object" && typeof (usage as TurnUsage).costUsd === "number" ? (usage as TurnUsage) : null;
+}
+
+/** Attach a failed turn's usage to the error it ends with (see usageOfFailedTurn). */
+export function withTurnUsage<E extends Error>(err: E, usage: TurnUsage): E {
+  Object.defineProperty(err, "turnUsage", { value: usage, enumerable: false });
+  return err;
+}
+
 export interface AdapterRunResult {
   /** The agent's final text for the turn. */
   text: string;

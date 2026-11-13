@@ -4,11 +4,16 @@
  * options this package passes are ones the CLI accepts, that a tool call reaches an in-process MCP tool
  * through the boundary, that the boundary's appended blocks (text and an image) reach the model with the
  * tool's result, that a prompt of parts reaches it as content blocks (an image included) on a fresh run and
- * on a resume, and that the session id, the prose and the usage come back.
+ * on a resume, that a `settings` file's apiKeyHelper is what authenticates a turn (no settings source is
+ * read otherwise), and that the session id, the prose and the usage come back.
  *
  *   bun scripts/verify-claude-fake.ts
  */
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { z } from "zod";
+import { usageOfFailedTurn } from "../src/adapter.ts";
 import { ClaudeBackend } from "../src/claude/index.ts";
 import { ok, type ToolBundle, type ToolContent } from "../src/tool.ts";
 
@@ -40,7 +45,7 @@ const check = (cond: unknown, m: string) => (cond ? log(`ok  ${m}`) : fail(m));
 
 type Block = { type: string; text?: string; content?: unknown; tool_use_id?: string; source?: { type?: string; media_type?: string; data?: string } };
 type Msg = { role: string; content: string | Block[] };
-const seen: Array<{ path: string; system?: string; messages?: Msg[]; tools?: Array<{ name: string }> }> = [];
+const seen: Array<{ path: string; system?: string; messages?: Msg[]; tools?: Array<{ name: string }>; apiKey?: string | null }> = [];
 
 const ev = (type: string, data: unknown) => `event: ${type}\ndata: ${JSON.stringify({ type, ...(data as object) })}\n\n`;
 function stream(id: string, blocks: Array<{ type: "text"; text: string } | { type: "tool_use"; id: string; name: string; input: unknown }>, stop: string): Response {
@@ -65,13 +70,16 @@ const fake = Bun.serve({
   async fetch(req) {
     const url = new URL(req.url);
     const body = req.method === "POST" ? ((await req.json().catch(() => ({}))) as { system?: unknown; messages?: Msg[]; tools?: Array<{ name: string }>; stream?: boolean }) : {};
-    seen.push({ path: url.pathname, system: JSON.stringify(body.system ?? ""), messages: body.messages, tools: body.tools });
+    seen.push({ path: url.pathname, system: JSON.stringify(body.system ?? ""), messages: body.messages, tools: body.tools, apiKey: req.headers.get("x-api-key") });
     if (url.pathname.endsWith("/count_tokens")) return Response.json({ input_tokens: 10 });
     if (!url.pathname.endsWith("/v1/messages")) return Response.json({});
     const last = body.messages?.[body.messages.length - 1];
     const blocks = Array.isArray(last?.content) ? last!.content : [];
     const result = blocks.find((b) => b.type === "tool_result");
     const hasTool = body.tools?.some((t) => t.name === "mcp__ws__echo");
+    if (JSON.stringify(body.messages ?? []).includes("CREDIT ERROR")) {
+      return Response.json({ type: "error", error: { type: "invalid_request_error", message: "Your credit balance is too low to access the Anthropic API." } }, { status: 400 });
+    }
     if (!hasTool) return stream("msg_side", [{ type: "text", text: "ok" }], "end_turn"); // the CLI's own side requests
     if (JSON.stringify(last).includes("SECOND TURN")) return stream("msg_3", [{ type: "text", text: "Seen again." }], "end_turn");
     if (JSON.stringify(body.messages).includes("once more")) return stream("msg_3", [{ type: "text", text: "Again." }], "end_turn"); // the system-prompt resumes below
@@ -171,6 +179,31 @@ try {
   const liveResumed = lastMain();
   check(liveResumed.system!.includes("You are an edited test.") && !liveResumed.system!.includes("You are a test."), "with liveSystemPrompt a resume sends the turn's new system prompt");
   check(JSON.stringify(liveResumed.messages).includes("please echo hello"), "and the resumed conversation keeps its history");
+
+  // A login that is only a settings file: an empty config dir, and an apiKeyHelper in the file passed as
+  // `settings`. With no ANTHROPIC_API_KEY in the environment, the helper's key is the only one there is.
+  const dir = mkdtempSync(join(tmpdir(), "claude-settings-"));
+  writeFileSync(join(dir, "key"), "sk-ant-from-helper\n");
+  writeFileSync(join(dir, "settings.json"), JSON.stringify({ apiKeyHelper: `cat ${JSON.stringify(join(dir, "key"))}` }));
+  const envKey = process.env.ANTHROPIC_API_KEY;
+  delete process.env.ANTHROPIC_API_KEY;
+  try {
+    const mark = seen.length;
+    const viaHelper = await new ClaudeBackend({ defaultModel: "claude-sonnet-4-5", configDir: dir, settings: join(dir, "settings.json") }).run({ prompt: "no tools here", tools: [] }, { signal: ac.signal });
+    const keys = [...new Set(seen.slice(mark).filter((s) => s.path.endsWith("/v1/messages")).map((s) => s.apiKey))];
+    check(viaHelper.text === "ok" && keys.length === 1 && keys[0] === "sk-ant-from-helper", `a turn authenticated with the settings file's apiKeyHelper (keys sent: ${keys.join(", ")})`);
+
+    // An API error mid-turn: Claude Code reports it as a result, the SDK throws its own error for it, and
+    // what the turn cost still rides on that error.
+    const failing = await new ClaudeBackend({ defaultModel: "claude-sonnet-4-5", configDir: dir, settings: join(dir, "settings.json") })
+      .run({ prompt: "CREDIT ERROR", tools: [] }, { signal: ac.signal })
+      .then(() => null, (e: unknown) => e);
+    check(failing instanceof Error && /credit balance is too low/i.test(failing.message), `an API error fails the turn with its message (${failing instanceof Error ? failing.message : String(failing)})`);
+    check(usageOfFailedTurn(failing) != null, `and the failed turn's usage is on the error (${JSON.stringify(usageOfFailedTurn(failing))})`);
+  } finally {
+    if (envKey === undefined) delete process.env.ANTHROPIC_API_KEY;
+    else process.env.ANTHROPIC_API_KEY = envKey;
+  }
   log("PASS");
 } catch (e) {
   fail(`the turn threw: ${e instanceof Error ? e.message : String(e)}\nrequests: ${seen.map((s) => s.path).join(" ")}`);
