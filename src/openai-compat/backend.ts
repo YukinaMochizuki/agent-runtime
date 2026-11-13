@@ -1,7 +1,7 @@
 import { createOpenAICompatible } from "@ai-sdk/openai-compatible";
 import { generateText, isStepCount, streamText, tool, type LanguageModel, type ModelMessage, type ToolResultPart, type ToolSet, type UserModelMessage } from "ai";
 import { z } from "zod";
-import type { AdapterContinueInput, AdapterRunInput, AdapterRunOptions, AdapterRunResult, BackendAdapter, CompactionEvent, TurnUsage } from "../adapter.ts";
+import { LostSessionError, type AdapterContinueInput, type AdapterRunInput, type AdapterRunOptions, type AdapterRunResult, type BackendAdapter, type CompactionEvent, type TurnUsage } from "../adapter.ts";
 import { runAtBoundary, type ToolBoundary } from "../boundary.ts";
 import type { EffortLevel } from "../effort.ts";
 import type { Prompt, ToolBundle, ToolDef, ToolResult } from "../tool.ts";
@@ -30,8 +30,12 @@ import { defaultCompactor, estimateTokens, SUMMARY_INSTRUCTIONS, TOOL_IMAGES_PRE
 
 /** Where a conversation's messages live. A host implements it on its own store. */
 export interface ConversationStore {
-  /** Every message of the conversation, oldest first (empty for a new one). */
-  load(conversationId: string): Promise<ModelMessage[]>;
+  /**
+   * Every message of the conversation, oldest first (empty for a new one). `null`: the store has no such
+   * conversation (its history was deleted), which `continueRun` reports as `LostSessionError`. A store that
+   * cannot tell the two apart returns `[]`, and the turn then starts on an empty history.
+   */
+  load(conversationId: string): Promise<ModelMessage[] | null>;
   /** Append messages, in order, as they are produced. */
   append(conversationId: string, messages: ModelMessage[]): Promise<void>;
   /**
@@ -267,6 +271,7 @@ export class OpenAICompatBackend implements BackendAdapter {
   async continueRun(input: AdapterContinueInput, opts: AdapterRunOptions): Promise<AdapterRunResult> {
     opts.onSessionId?.(input.backendSessionId);
     const history = await this.opts.store.load(input.backendSessionId);
+    if (history === null) throw new LostSessionError(input.backendSessionId);
     // A turn that ended normally, or was stopped, answered every call it made. One whose PROCESS died in
     // the middle of a tool did not; answer those now, saying so, or the conversation cannot go on.
     const dangling = unansweredCalls(history);

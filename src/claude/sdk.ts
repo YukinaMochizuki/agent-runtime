@@ -1,6 +1,6 @@
 import { query, type Options, type SDKUserMessage } from "@anthropic-ai/claude-agent-sdk";
 import { EFFORT_LEVELS, type EffortLevel } from "../effort.ts";
-import type { CompactionEvent, ModelChoice, TurnUsage } from "../adapter.ts";
+import { LostSessionError, type CompactionEvent, type ModelChoice, type TurnUsage } from "../adapter.ts";
 import type { Prompt, PromptPart } from "../tool.ts";
 import { ClaudeStreamTranslator } from "./stream.ts";
 
@@ -220,6 +220,25 @@ export function resultErrorMessage(result: { subtype: string; errors?: unknown }
   return `Claude Agent SDK run ended with "${result.subtype}"${errors.length ? `: ${errors.join("; ")}` : ""}`;
 }
 
+/**
+ * The Claude Code CLI's own words when the session to resume does not exist (a new machine, a cleaned config
+ * dir). Only this text counts as a lost session: a generic failure may be an outage or an expired login.
+ */
+export const LOST_SESSION_TEXT = "No conversation found with session ID";
+
+/**
+ * The error a non-success `result` ends the run with: `LostSessionError` when the run resumed
+ * `resumeSessionId` and one of the CLI's errors IS its lost-session message for that id (it starts with
+ * `LOST_SESSION_TEXT` and names the id), a plain Error otherwise: an upstream error that merely quotes the
+ * phrase is not a lost session. Its message is `resultErrorMessage` either way.
+ */
+export function resultError(result: { subtype: string; errors?: unknown }, resumeSessionId?: string): Error {
+  const message = resultErrorMessage(result);
+  const errors = Array.isArray(result.errors) ? result.errors.filter((e): e is string => typeof e === "string") : [];
+  const lost = !!resumeSessionId && errors.some((e) => e.trimStart().startsWith(LOST_SESSION_TEXT) && e.includes(resumeSessionId));
+  return lost ? new LostSessionError(resumeSessionId!, message) : new Error(message);
+}
+
 export async function runClaudeAgent(input: RunClaudeAgentInput): Promise<RunClaudeAgentResult> {
   const options = claudeQueryOptions(input);
 
@@ -292,7 +311,7 @@ export async function runClaudeAgent(input: RunClaudeAgentInput): Promise<RunCla
       if (message.subtype === "success") {
         text = message.result;
       } else {
-        throw new Error(resultErrorMessage(message));
+        throw resultError(message, input.resumeSessionId);
       }
     }
   }

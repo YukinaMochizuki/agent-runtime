@@ -8,6 +8,7 @@ export type {
   ModelChoice,
   TurnUsage,
 } from "./adapter.ts";
+export { LostSessionError } from "./adapter.ts";
 export { EFFORT_LEVELS, type EffortLevel } from "./effort.ts";
 export {
   err,

@@ -10,7 +10,22 @@ import type { Prompt, ToolBundle } from "./tool.ts";
  *   - `run` starts a fresh conversation; result.backendSessionId is its id.
  *   - `continueRun` resumes an existing conversation in place.
  * Ids are NOT portable between drivers.
+ *
+ * A LOST conversation: `continueRun` on an id whose conversation no longer exists throws `LostSessionError`,
+ * whatever the driver. It is the only error that means that, so a host can start over fresh on it and treat
+ * every other failure (an outage, an expired login) as one that must not discard the conversation.
  */
+
+/** `continueRun`'s conversation no longer exists (the session file or the stored history is gone). */
+export class LostSessionError extends Error {
+  constructor(
+    readonly backendSessionId: string,
+    message = `conversation ${backendSessionId} no longer exists`,
+  ) {
+    super(message);
+    this.name = "LostSessionError";
+  }
+}
 
 export interface AdapterRunOptions {
   /**
