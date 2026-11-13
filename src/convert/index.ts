@@ -9,6 +9,7 @@ import { claudeToModelMessages, modelMessagesToClaude, type ConvertOptions } fro
  *
  *   claudeSessionMessages(id, { after })   a session (or its part after a position) as ModelMessage[]
  *   appendToClaudeSession(id, messages)    ModelMessage[] written onto a session (null: a new one)
+ *   forkClaudeSession(id)                  a copy of a session, as it is, under a new id (one login)
  *
  * What carries and what does not: ./messages.ts. How a session file is read and extended: ../claude/session.ts.
  * A carried part is the messages themselves; nothing is added to say they were carried.
@@ -29,6 +30,7 @@ export {
   claudeProjectDir,
   CONVERTED_MODEL,
   findClaudeSession,
+  forkClaudeSession,
   readClaudeSession,
   type AppendClaudeSessionOptions,
   type ClaudeBlock,
