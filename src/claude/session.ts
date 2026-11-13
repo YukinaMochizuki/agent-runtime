@@ -1,6 +1,6 @@
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 
 /**
  * A Claude Code session's FILE, read and extended from outside the CLI: what a host needs to carry a
@@ -226,4 +226,35 @@ export function appendClaudeSession(id: string | null, messages: ClaudeMessage[]
   const existing = existsSync(file) ? readFileSync(file, "utf8") : "";
   appendFileSync(file, (existing && !existing.endsWith("\n") ? "\n" : "") + lines.join("\n") + "\n");
   return { sessionId, end: parent };
+}
+
+/**
+ * Copy session `id` into a new session beside it, as it is: the same entries (uuids, signed thinking, the
+ * CLI's own entries), each with `sessionId` rewritten to the new id; a line that does not parse (cut short)
+ * is copied as it is. The CLI resumes the copy exactly as it would the original, and the two then go their
+ * own ways (verified against the real CLI 2.1.322: the same request, byte for byte, from either). Returns
+ * the new id and its position, which is the original's. Throws when `id` names no session. Nothing may run on
+ * the session while it is copied.
+ */
+export function forkClaudeSession(id: string, opts: ClaudeSessionPlace = {}): { sessionId: string; end: string | null } {
+  const file = findClaudeSession(id, opts.configDir);
+  if (!file) throw new Error(`no Claude session ${id} in ${claudeConfigDir(opts.configDir)}`);
+  const sessionId = crypto.randomUUID();
+  const text = readFileSync(file, "utf8");
+  const copied = text
+    .split("\n")
+    .map((line) => {
+      if (!line.trim()) return line;
+      try {
+        const entry = JSON.parse(line) as Record<string, unknown>;
+        if (entry.sessionId !== id) return line;
+        entry.sessionId = sessionId;
+        return JSON.stringify(entry);
+      } catch {
+        return line;
+      }
+    })
+    .join("\n");
+  writeFileSync(join(dirname(file), `${sessionId}.jsonl`), copied, { flag: "wx" });
+  return { sessionId, end: chain(entries(file)).filter((e) => isConversation(e) && !e.isMeta && e.message).at(-1)?.uuid ?? null };
 }

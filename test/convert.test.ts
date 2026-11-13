@@ -11,6 +11,7 @@ import {
   claudeToModelMessages,
   CONVERTED_MODEL,
   findClaudeSession,
+  forkClaudeSession,
   modelMessagesToClaude,
   readClaudeSession,
   type ClaudeMessage,
@@ -211,6 +212,36 @@ describe("modelMessagesToClaude", () => {
 
 describe("Claude session files", () => {
   const cfg = () => mkdtempSync(join(tmpdir(), "convert-"));
+
+  test("a fork is the session as it is, under a new id beside it; the two then go their own ways", () => {
+    const configDir = cfg();
+    const dir = claudeProjectDir("/w", configDir);
+    mkdirSync(dir, { recursive: true });
+    const e = (o: object) => JSON.stringify({ sessionId: "s1", isSidechain: false, timestamp: "2026-11-13T00:00:00.000Z", ...o });
+    const original = [
+      JSON.stringify({ type: "queue-operation", sessionId: "s1" }),
+      e({ type: "user", uuid: "u1", parentUuid: null, message: { role: "user", content: [{ type: "text", text: "hello" }] } }),
+      e({ type: "assistant", uuid: "b1", parentUuid: "u1", message: { id: "msg_1", role: "assistant", content: [{ type: "thinking", thinking: "t", signature: "SIG" }] } }),
+      e({ type: "assistant", uuid: "b2", parentUuid: "b1", message: { id: "msg_1", role: "assistant", content: [{ type: "text", text: "hi" }] } }),
+      "{ truncated",
+    ].join("\n") + "\n";
+    writeFileSync(join(dir, "s1.jsonl"), original);
+
+    const fork = forkClaudeSession("s1", { configDir });
+    expect(fork.sessionId).not.toBe("s1");
+    expect(fork.end).toBe("b2");
+    expect(findClaudeSession(fork.sessionId, configDir)).toBe(join(dir, `${fork.sessionId}.jsonl`));
+    // The same entries, only the session id changed; a line that does not parse is kept as it is.
+    expect(readFileSync(join(dir, `${fork.sessionId}.jsonl`), "utf8")).toBe(original.replaceAll('"sessionId":"s1"', `"sessionId":"${fork.sessionId}"`));
+    expect(readClaudeSession(fork.sessionId, { configDir }).messages).toEqual(readClaudeSession("s1", { configDir }).messages);
+
+    // Appending to the fork leaves the original untouched.
+    appendClaudeSession(fork.sessionId, [{ role: "user", content: "only in the fork" }], { configDir });
+    expect(readFileSync(join(dir, "s1.jsonl"), "utf8")).toBe(original);
+    expect(readClaudeSession(fork.sessionId, { configDir }).messages).toHaveLength(3);
+
+    expect(() => forkClaudeSession("missing", { configDir })).toThrow("no Claude session missing");
+  });
 
   test("a new session, then more appended: read back in order, positions resume after each part", () => {
     const configDir = cfg();
