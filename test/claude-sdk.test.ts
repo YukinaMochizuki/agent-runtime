@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { claudePrompt, claudeQueryOptions, claudeSubprocessEnv, resultErrorMessage } from "../src/claude/sdk.ts";
+import { LostSessionError } from "../src/adapter.ts";
+import { claudePrompt, claudeQueryOptions, claudeSubprocessEnv, resultError, resultErrorMessage } from "../src/claude/sdk.ts";
 
 /** The query options ARE the behaviour: each flag here is a lesson a host would otherwise relearn. */
 describe("claudeQueryOptions", () => {
@@ -72,6 +73,26 @@ test("a failed result's message carries the CLI's errors when it gave some, and 
   expect(resultErrorMessage({ subtype: "error_during_execution", errors: ["a", "b"] })).toBe('Claude Agent SDK run ended with "error_during_execution": a; b');
   expect(resultErrorMessage({ subtype: "error_max_turns", errors: [] })).toBe('Claude Agent SDK run ended with "error_max_turns"');
   expect(resultErrorMessage({ subtype: "error_max_turns" })).toBe('Claude Agent SDK run ended with "error_max_turns"');
+});
+
+test("a resume the CLI cannot find is a LostSessionError; every other failed result is a plain Error", () => {
+  const lost = { subtype: "error_during_execution", errors: ["No conversation found with session ID: s1"] };
+  const e = resultError(lost, "s1");
+  expect(e).toBeInstanceOf(LostSessionError);
+  expect((e as LostSessionError).backendSessionId).toBe("s1");
+  expect(e.message).toBe(resultErrorMessage(lost));
+  // Not resuming: the text cannot be about our session.
+  expect(resultError(lost)).not.toBeInstanceOf(LostSessionError);
+  // Another failure on a resume (an outage, an expired login) must not read as lost.
+  const other = resultError({ subtype: "error_during_execution", errors: ["API Error: 529 overloaded"] }, "s1");
+  expect(other).not.toBeInstanceOf(LostSessionError);
+  expect(other.message).toBe('Claude Agent SDK run ended with "error_during_execution": API Error: 529 overloaded');
+  // An error that only quotes the phrase, or names another session, is not this session lost.
+  const quoted = { subtype: "error_during_execution", errors: ['API Error: 400 {"message":"No conversation found with session ID: s1"}'] };
+  expect(resultError(quoted, "s1")).not.toBeInstanceOf(LostSessionError);
+  expect(resultError(lost, "s2")).not.toBeInstanceOf(LostSessionError);
+  // Among several errors, the CLI's own one still counts.
+  expect(resultError({ subtype: "error_during_execution", errors: ["warning", "No conversation found with session ID: s1"] }, "s1")).toBeInstanceOf(LostSessionError);
 });
 
 // The SDK's `env` replaces the CLI child's environment wholesale, so the switch that keeps the claude.ai

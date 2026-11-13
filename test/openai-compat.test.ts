@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import type { CompactionEvent } from "../src/adapter.ts";
+import { LostSessionError, type CompactionEvent } from "../src/adapter.ts";
 import type { LanguageModelV4StreamPart } from "@ai-sdk/provider";
 import type { ModelMessage } from "ai";
 import { MockLanguageModelV4, convertArrayToReadableStream } from "ai/test";
@@ -123,6 +123,20 @@ describe("OpenAICompatBackend", () => {
     expect(prompt).toContain("first");
     expect(prompt).toContain("two");
     expect(store.all.get("conv-1")!.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+  });
+
+  test("a continue on a conversation the store does not have (load: null) is a LostSessionError, before any model call", async () => {
+    const store = { ...memoryStore(), load: async () => null };
+    const model = scripted(says("never"));
+    const run = backend(model, store).continueRun({ prompt: "two", tools: [], backendSessionId: "gone" }, {});
+    await expect(run).rejects.toBeInstanceOf(LostSessionError);
+    await expect(run).rejects.toMatchObject({ backendSessionId: "gone" });
+    expect(model.doStreamCalls.length).toBe(0);
+  });
+
+  test("a continue on an empty history (load: []) is not lost: the turn runs", async () => {
+    const r = await backend(scripted(says("hello"))).continueRun({ prompt: "hi", tools: [], backendSessionId: "conv-1" }, {});
+    expect(r.text).toBe("hello");
   });
 
   test("a stop before the next call ends the turn; the tool that ran is still recorded", async () => {
