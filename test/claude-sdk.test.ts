@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { LostSessionError } from "../src/adapter.ts";
+import { LostSessionError, usageOfFailedTurn, withTurnUsage } from "../src/adapter.ts";
 import { claudePrompt, claudeQueryOptions, claudeSubprocessEnv, resultError, resultErrorMessage } from "../src/claude/sdk.ts";
 
 /** The query options ARE the behaviour: each flag here is a lesson a host would otherwise relearn. */
@@ -105,3 +105,23 @@ test("claude subprocess env turns off claude.ai connectors and keeps the inherit
   expect(env.CLAUDE_CONFIG_DIR).toBe(process.env.CLAUDE_CONFIG_DIR);
   expect(claudeSubprocessEnv("/tmp/acct").CLAUDE_CONFIG_DIR).toBe("/tmp/acct");
 });
+
+// A login that authenticates through a setting (an apiKeyHelper) is a settings FILE: with no setting
+// sources read, the flag-settings layer is the only way it reaches Claude Code (verify-claude-fake.ts runs
+// it through the real CLI).
+test("a settings file is passed to the SDK as flag settings, and only when given", () => {
+  expect(claudeQueryOptions({ prompt: "hi", settings: "/acct/settings.json" }).settings).toBe("/acct/settings.json");
+  expect(claudeQueryOptions({ prompt: "hi", settings: "/acct/settings.json" }).settingSources).toEqual([]);
+  expect("settings" in claudeQueryOptions({ prompt: "hi" })).toBe(false);
+});
+
+test("a failed turn's usage rides on its error, and an error without one reads as null", () => {
+  const usage = { model: "m", costUsd: 0.42, inputTokens: 1, outputTokens: 2, cacheReadTokens: 3, cacheCreationTokens: 4 };
+  const err = withTurnUsage(resultError({ subtype: "error_during_execution", errors: ["boom"] }), usage);
+  expect(usageOfFailedTurn(err)).toEqual(usage);
+  expect(err.message).toBe(resultError({ subtype: "error_during_execution", errors: ["boom"] }).message);
+  expect(JSON.stringify(err)).not.toContain("0.42"); // not enumerable: it does not leak into a serialised error
+  expect(usageOfFailedTurn(new Error("plain"))).toBeNull();
+  expect(usageOfFailedTurn(null)).toBeNull();
+});
+

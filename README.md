@@ -72,6 +72,10 @@ updates between tool calls reach the host, the session id surfaced from the firs
 interrupted turn is resumable), context usage taken from the last request rather than the turn's sum,
 and Claude Code's non-streaming fallback replayed without duplicating what already streamed. Which login
 a turn runs on is a `configDir` (`CLAUDE_CONFIG_DIR`); choosing among several is the host's policy.
+Because no settings file is read, a login that authenticates through a setting (an `apiKeyHelper` for a
+Console API key) passes its settings file as `settings`, which Claude Code loads as flag settings on a
+turn, `listClaudeModels` and `probeClaudeAccount` alike. A turn that fails after its result arrived still
+reports what it cost: `usageOfFailedTurn(err)`.
 Claude Code records a conversation's system prompt and replays it on every resume, ignoring a new one; a
 host whose prompt changes mid-conversation sets `liveSystemPrompt`, and each turn's prompt is then sent
 fresh (an edit costs the prompt cache once).

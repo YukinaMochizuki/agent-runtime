@@ -6,6 +6,8 @@ import { runClaudeAgent, type RateLimitReading } from "./sdk.ts";
 export interface ClaudeBackendOptions {
   /** The login turns run on (absent: the process's own environment). */
   configDir?: string | null;
+  /** A settings file every turn loads as Claude Code's flag settings (`RunClaudeAgentInput.settings`). */
+  settings?: string | null;
   /** The model when a run names none (absent: the SDK's default). */
   defaultModel?: string;
   /** What every tool call passes through. */
@@ -50,6 +52,7 @@ export class ClaudeBackend implements BackendAdapter {
     const builtin = this.opts.builtinTools ?? [];
     const r = await runClaudeAgent({
       configDir: this.opts.configDir ?? null,
+      ...(this.opts.settings ? { settings: this.opts.settings } : {}),
       prompt: input.prompt,
       // By default the system prompt is the conversation's: a resume keeps the one it started with (Claude
       // Code replays its recorded copy). With `liveSystemPrompt` it is the turn's: see the option.
